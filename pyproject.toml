@@ -1,0 +1,15 @@
+[project]
+name = "Abraxas"
+version = "0.1.0"
+description = "Default template for PDM package"
+authors = [
+    {name = "pi-dal", email = "hi@pi-dal.com"},
+]
+dependencies = ["rich>=14.3.2", "openai>=2.21.0", "python-dotenv>=1.2.1", "prompt-toolkit>=3.0.52"]
+requires-python = "==3.14.*"
+readme = "README.md"
+license = {text = "MIT"}
+
+
+[tool.pdm]
+distribution = false
