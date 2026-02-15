@@ -36,14 +36,14 @@ Cover all image-generation modes documented in the Gemini guide while staying ba
 
 ## Execution contract (bash-first)
 - Prefer shell + curl.
-- API key order: `GOOGLE_API_KEY` then `GEMINI_API_KEY`.
-- If key missing, return `image generation error: missing GOOGLE_API_KEY or GEMINI_API_KEY`.
+- API key: `GEMINI_API_KEY`.
+- If key missing, return `image generation error: missing GEMINI_API_KEY`.
 - Always parse output parts; save first image (`inline_data`) and print text parts.
 - When `nano_banana_image` plugin exists, prefer calling that plugin over hand-writing one-off HTTP payloads.
 
 ### 1) Text-to-image
 ```bash
-API_KEY="${GOOGLE_API_KEY:-$GEMINI_API_KEY}"
+API_KEY="${GEMINI_API_KEY}"
 MODEL="${MODEL:-gemini-3-pro-image-preview}"
 PROMPT="<descriptive scene prompt>"
 

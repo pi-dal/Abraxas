@@ -41,9 +41,6 @@ def _resolve_api_key(payload: dict[str, Any]) -> str:
     explicit = str(payload.get("api_key", "")).strip()
     if explicit:
         return explicit
-    key = os.getenv("GOOGLE_API_KEY", "").strip()
-    if key:
-        return key
     return os.getenv("GEMINI_API_KEY", "").strip()
 
 
@@ -334,7 +331,7 @@ def _handle(payload: dict[str, Any]) -> str:
 
         api_key = _resolve_api_key(payload)
         if not api_key:
-            return "image generation error: missing GOOGLE_API_KEY or GEMINI_API_KEY"
+            return "image generation error: missing GEMINI_API_KEY"
 
         model = _resolve_model(payload)
 

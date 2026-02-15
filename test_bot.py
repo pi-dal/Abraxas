@@ -932,7 +932,7 @@ class BotTests(unittest.TestCase):
     def test_nano_banana_plugin_missing_key_error(self):
         nano_banana_image = self._load_nano_banana_plugin_module()
 
-        with patch.dict(os.environ, {"GOOGLE_API_KEY": "", "GEMINI_API_KEY": ""}, clear=False):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": ""}, clear=False):
             out = nano_banana_image._handle(
                 {
                     "mode": "text_to_image",
@@ -940,7 +940,7 @@ class BotTests(unittest.TestCase):
                     "api_key": "",
                 }
             )
-        self.assertIn("missing GOOGLE_API_KEY or GEMINI_API_KEY", out)
+        self.assertIn("missing GEMINI_API_KEY", out)
 
     def test_nano_banana_plugin_search_mode_adds_google_search_tool(self):
         nano_banana_image = self._load_nano_banana_plugin_module()
@@ -968,7 +968,7 @@ class BotTests(unittest.TestCase):
         self.assertIn("pdm run abraxas-telegram", content)
         self.assertIn("plugins are hot-reloaded", content.lower())
 
-    def test_load_settings_uses_api_key_only(self):
+    def test_load_settings_reads_openai_base_url_and_model(self):
         keys = [
             "API_KEY",
             "OPENAI_API_KEY",
@@ -993,8 +993,8 @@ class BotTests(unittest.TestCase):
                     )
                 cfg = core_settings.load_runtime_settings(path)
                 self.assertEqual(cfg["api_key"], "generic-key")
-                self.assertEqual(cfg["base_url"], DEFAULT_BASE_URL)
-                self.assertEqual(cfg["model"], DEFAULT_MODEL)
+                self.assertEqual(cfg["base_url"], "https://api.should.not.use")
+                self.assertEqual(cfg["model"], "should-not-use")
         finally:
             for k, v in snapshot.items():
                 if v is None:

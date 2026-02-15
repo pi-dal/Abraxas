@@ -57,10 +57,12 @@ def _read_bool_env(name: str, default: bool) -> bool:
 
 def load_runtime_settings(env_path: str | None = None) -> dict[str, str | int | None]:
     load_dotenv(resolve_env_path(env_path))
+    base_url = os.getenv("OPENAI_BASE_URL", "").strip() or DEFAULT_BASE_URL
+    model = os.getenv("OPENAI_MODEL", "").strip() or DEFAULT_MODEL
     return {
         "api_key": os.getenv("API_KEY"),
-        "base_url": DEFAULT_BASE_URL,
-        "model": DEFAULT_MODEL,
+        "base_url": base_url,
+        "model": model,
         "telegram_bot_token": os.getenv("TELEGRAM_BOT_TOKEN"),
         "allowed_telegram_chat_ids": os.getenv("ALLOWED_TELEGRAM_CHAT_IDS"),
         "skills_dir": os.getenv("ABRAXAS_SKILLS_DIR", DEFAULT_SKILLS_DIR),

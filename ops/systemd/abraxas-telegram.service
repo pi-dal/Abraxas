@@ -1,0 +1,22 @@
+[Unit]
+Description=Abraxas Telegram Bot (PDM)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi-dal
+Group=pi-dal
+WorkingDirectory=/home/pi-dal/Abraxas
+Environment="PATH=/home/pi-dal/.local/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="ABRAXAS_ENV_PATH=/home/pi-dal/Abraxas/.env"
+ExecStart=/usr/bin/env pdm run abraxas-telegram
+Restart=always
+RestartSec=3
+TimeoutStopSec=30
+KillSignal=SIGINT
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
