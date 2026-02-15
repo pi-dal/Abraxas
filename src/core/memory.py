@@ -1,29 +1,19 @@
-import os
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
 
-DEFAULT_MEMORY_DIR = "src/memory"
-DEFAULT_MEMORY_TOP_K = 6
-DEFAULT_MEMORY_MAX_INJECT_CHARS = 4000
-DEFAULT_QMD_COMMAND = "qmd"
-DEFAULT_QMD_TIMEOUT_SEC = 30
-DEFAULT_MEMORY_TZ = "Asia/Shanghai"
-
-
-def _read_int_env(name: str, default: int) -> int:
-    raw = os.getenv(name, "").strip()
-    if not raw:
-        return default
-    try:
-        value = int(raw)
-    except ValueError:
-        return default
-    if value <= 0:
-        return default
-    return value
+from .settings import (
+    DEFAULT_MEMORY_DIR,
+    DEFAULT_MEMORY_MAX_INJECT_CHARS,
+    DEFAULT_MEMORY_TOP_K,
+    DEFAULT_MEMORY_TZ,
+    DEFAULT_QMD_COMMAND,
+    DEFAULT_QMD_TIMEOUT_SEC,
+    load_runtime_settings,
+)
 
 
 @dataclass
@@ -159,13 +149,18 @@ class MemoryRuntime:
             return "memory index refresh failed"
 
 
-def create_memory_runtime(memory_dir: str | None = None) -> MemoryRuntime:
-    runtime_dir = memory_dir or os.getenv("ABRAXAS_MEMORY_DIR", DEFAULT_MEMORY_DIR)
-    qmd_command = os.getenv("ABRAXAS_QMD_COMMAND", DEFAULT_QMD_COMMAND)
-    top_k = _read_int_env("ABRAXAS_MEMORY_TOP_K", DEFAULT_MEMORY_TOP_K)
-    max_chars = _read_int_env("ABRAXAS_MEMORY_MAX_INJECT_CHARS", DEFAULT_MEMORY_MAX_INJECT_CHARS)
-    qmd_timeout_sec = _read_int_env("ABRAXAS_QMD_TIMEOUT_SEC", DEFAULT_QMD_TIMEOUT_SEC)
-    tz_name = os.getenv("ABRAXAS_MEMORY_TZ", DEFAULT_MEMORY_TZ)
+def create_memory_runtime(
+    memory_dir: str | None = None,
+    *,
+    settings: dict[str, Any] | None = None,
+) -> MemoryRuntime:
+    runtime_settings = settings or load_runtime_settings()
+    runtime_dir = memory_dir or str(runtime_settings.get("memory_dir", DEFAULT_MEMORY_DIR))
+    qmd_command = str(runtime_settings.get("qmd_command", DEFAULT_QMD_COMMAND))
+    top_k = int(runtime_settings.get("memory_top_k", DEFAULT_MEMORY_TOP_K))
+    max_chars = int(runtime_settings.get("memory_max_inject_chars", DEFAULT_MEMORY_MAX_INJECT_CHARS))
+    qmd_timeout_sec = int(runtime_settings.get("qmd_timeout_sec", DEFAULT_QMD_TIMEOUT_SEC))
+    tz_name = str(runtime_settings.get("memory_tz", DEFAULT_MEMORY_TZ))
     return MemoryRuntime(
         memory_dir=Path(runtime_dir),
         qmd_command=qmd_command,

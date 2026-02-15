@@ -1,4 +1,3 @@
-import os
 from typing import Any
 
 from openai import OpenAI
@@ -6,8 +5,14 @@ from typing import Protocol
 
 from .memory import create_memory_runtime
 from .nous import load_nous_prompt
-from .settings import load_settings
-from .skills import DEFAULT_SKILLS_DIR, load_skills_prompt
+from .settings import (
+    DEFAULT_AUTO_COMPACT_KEEP_LAST_MESSAGES,
+    DEFAULT_AUTO_COMPACT_MAX_TOKENS,
+    DEFAULT_NOUS_PATH,
+    DEFAULT_SKILLS_DIR,
+    load_runtime_settings,
+)
+from .skills import load_skills_prompt
 from .tools import create_default_registry, tool_label
 
 
@@ -34,28 +39,16 @@ SYSTEM_PROMPT = (
     "When task is done, return the final answer in plain text."
 )
 
-DEFAULT_AUTO_COMPACT_MAX_TOKENS = 12000
-DEFAULT_AUTO_COMPACT_KEEP_LAST_MESSAGES = 12
-
-
-def _read_int_env(name: str, default: int, *, allow_zero: bool = False) -> int:
-    raw = os.getenv(name, "").strip()
-    if not raw:
-        return default
-    try:
-        value = int(raw)
-    except ValueError:
-        return default
-    if value < 0:
-        return default
-    if value == 0 and not allow_zero:
-        return default
-    return value
-
-
-def build_system_prompt(skills_dir: str | None = None, nous_path: str | None = None) -> str:
-    resolved_skills_dir = skills_dir or os.getenv("ABRAXAS_SKILLS_DIR", DEFAULT_SKILLS_DIR)
-    nous_prompt = load_nous_prompt(nous_path)
+def build_system_prompt(
+    skills_dir: str | None = None,
+    nous_path: str | None = None,
+    *,
+    settings: dict[str, str | int | None] | None = None,
+) -> str:
+    runtime_settings = settings or load_runtime_settings()
+    resolved_skills_dir = skills_dir or str(runtime_settings.get("skills_dir", DEFAULT_SKILLS_DIR))
+    resolved_nous_path = nous_path or str(runtime_settings.get("nous_path", DEFAULT_NOUS_PATH))
+    nous_prompt = load_nous_prompt(resolved_nous_path)
     skills_prompt = load_skills_prompt(resolved_skills_dir)
     if not nous_prompt and not skills_prompt:
         return SYSTEM_PROMPT
@@ -73,25 +66,29 @@ class CodingBot:
         model: str | None = None,
         tool_registry: ToolRuntime | None = None,
     ):
-        config = load_settings()
-        self.client = OpenAI(api_key=config["api_key"], base_url=config["base_url"])
+        config = load_runtime_settings()
+        self.client = OpenAI(api_key=config["api_key"], base_url=str(config["base_url"]))
         self.model = model or str(config["model"])
         self.tool_registry = tool_registry or create_default_registry()
-        self.messages = [{"role": "system", "content": build_system_prompt()}]
-        self.memory_runtime = create_memory_runtime()
+        self.messages = [{"role": "system", "content": build_system_prompt(settings=config)}]
+        self.memory_runtime = create_memory_runtime(settings=config)
         memory_brief = self.memory_runtime.load_memory_brief()
         if memory_brief:
             self.messages.append({"role": "system", "content": f"[memory_brief]\n{memory_brief}"})
-        self.auto_compact_max_tokens = _read_int_env(
-            "ABRAXAS_AUTO_COMPACT_MAX_TOKENS",
-            DEFAULT_AUTO_COMPACT_MAX_TOKENS,
-            allow_zero=True,
+        self.auto_compact_max_tokens = int(
+            config.get(
+                "auto_compact_max_tokens",
+                DEFAULT_AUTO_COMPACT_MAX_TOKENS,
+            )
         )
-        self.auto_compact_keep_last_messages = _read_int_env(
-            "ABRAXAS_AUTO_COMPACT_KEEP_LAST_MESSAGES",
-            DEFAULT_AUTO_COMPACT_KEEP_LAST_MESSAGES,
+        self.auto_compact_keep_last_messages = int(
+            config.get(
+                "auto_compact_keep_last_messages",
+                DEFAULT_AUTO_COMPACT_KEEP_LAST_MESSAGES,
+            )
         )
-        self.auto_compact_instructions = os.getenv("ABRAXAS_AUTO_COMPACT_INSTRUCTIONS") or None
+        instructions = config.get("auto_compact_instructions")
+        self.auto_compact_instructions = str(instructions) if instructions else None
 
     def refresh_system_prompt(self) -> str:
         prompt = build_system_prompt()

@@ -16,6 +16,7 @@ from channel.cli import (
 import core.bot as core_bot
 import core.memory as core_memory
 import core.nous as core_nous
+import core.settings as core_settings
 from core.bot import SYSTEM_PROMPT
 from core.registry import build_tool_registry, create_reloadable_tool_registry
 from core import tools as core_tools
@@ -644,6 +645,65 @@ class BotTests(unittest.TestCase):
                     os.environ.pop(k, None)
                 else:
                     os.environ[k] = v
+
+    def test_load_runtime_settings_reads_abraxas_overrides(self):
+        keys = [
+            "API_KEY",
+            "ABRAXAS_SKILLS_DIR",
+            "ABRAXAS_MEMORY_DIR",
+            "ABRAXAS_MEMORY_DAILY_SYNC_TIME",
+            "ABRAXAS_NOUS_PATH",
+            "ABRAXAS_QMD_COMMAND",
+            "ABRAXAS_AUTO_COMPACT_MAX_TOKENS",
+        ]
+        snapshot = {k: os.environ.get(k) for k in keys}
+        for k in keys:
+            os.environ.pop(k, None)
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                env_path = os.path.join(td, ".env")
+                with open(env_path, "w", encoding="utf-8") as f:
+                    f.write(
+                        "API_KEY=test-key\n"
+                        "ABRAXAS_SKILLS_DIR=custom/skills\n"
+                        "ABRAXAS_MEMORY_DIR=custom/memory\n"
+                        "ABRAXAS_MEMORY_DAILY_SYNC_TIME=03:30\n"
+                        "ABRAXAS_NOUS_PATH=custom/NOUS.md\n"
+                        "ABRAXAS_QMD_COMMAND=qmdx\n"
+                        "ABRAXAS_AUTO_COMPACT_MAX_TOKENS=9999\n"
+                    )
+                cfg = core_settings.load_runtime_settings(env_path)
+                self.assertEqual(cfg["api_key"], "test-key")
+                self.assertEqual(cfg["skills_dir"], "custom/skills")
+                self.assertEqual(cfg["memory_dir"], "custom/memory")
+                self.assertEqual(cfg["memory_daily_sync_time"], "03:30")
+                self.assertEqual(cfg["nous_path"], "custom/NOUS.md")
+                self.assertEqual(cfg["qmd_command"], "qmdx")
+                self.assertEqual(cfg["auto_compact_max_tokens"], 9999)
+        finally:
+            for k, v in snapshot.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_create_memory_runtime_from_runtime_settings(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = {
+                "memory_dir": os.path.join(td, "memory-x"),
+                "qmd_command": "qmdx",
+                "memory_top_k": 9,
+                "memory_max_inject_chars": 1111,
+                "qmd_timeout_sec": 77,
+                "memory_tz": "Asia/Tokyo",
+            }
+            runtime = core_memory.create_memory_runtime(settings=cfg)
+            self.assertEqual(str(runtime.memory_dir), cfg["memory_dir"])
+            self.assertEqual(runtime.qmd_command, "qmdx")
+            self.assertEqual(runtime.top_k, 9)
+            self.assertEqual(runtime.max_inject_chars, 1111)
+            self.assertEqual(runtime.qmd_timeout_sec, 77)
+            self.assertEqual(runtime.tz_name, "Asia/Tokyo")
 
     def test_load_settings_ignores_legacy_keys(self):
         keys = ["API_KEY", "OPENAI_API_KEY", "GLM_API_KEY", "ZAI_API_KEY"]

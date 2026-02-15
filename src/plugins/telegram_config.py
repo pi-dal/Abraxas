@@ -1,11 +1,12 @@
 import json
 import os
 
+from core.settings import resolve_env_path
 from core.tools import ToolPlugin
 
 
 def _env_path() -> str:
-    return os.getenv("ABRAXAS_ENV_PATH", ".env")
+    return resolve_env_path()
 
 
 def _read_env(path: str) -> dict[str, str]:
@@ -135,4 +136,3 @@ def register(registry) -> None:
             handler=_handle,
         )
     )
-

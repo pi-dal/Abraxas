@@ -1,5 +1,4 @@
 import json
-import os
 import time
 import urllib.error
 import urllib.request
@@ -16,7 +15,7 @@ from core.nous import (
 from core.registry import ReloadableToolRegistry, create_reloadable_tool_registry
 from core.scheduler import DailyScheduler
 from core.skills import DEFAULT_SKILLS_DIR, SUPPORTED_SKILL_EXTENSIONS
-from core.settings import load_settings, load_telegram_settings
+from core.settings import load_runtime_settings
 
 TELEGRAM_API_BASE = "https://api.telegram.org"
 DEFAULT_TELEGRAM_COMMANDS = [
@@ -48,7 +47,8 @@ def _resolve_skills_dir(skills_dir: str) -> Path:
 
 
 def list_skill_files(skills_dir: str | None = None) -> list[str]:
-    resolved = _resolve_skills_dir(skills_dir or os.getenv("ABRAXAS_SKILLS_DIR", DEFAULT_SKILLS_DIR))
+    runtime = load_runtime_settings()
+    resolved = _resolve_skills_dir(skills_dir or str(runtime.get("skills_dir", DEFAULT_SKILLS_DIR)))
     if not resolved.exists() or not resolved.is_dir():
         return []
     return sorted(
@@ -517,7 +517,9 @@ def run_telegram_bot(
     bot_factory=CodingBot,
     tool_registry: ReloadableToolRegistry | None = None,
     sync_commands_on_start: bool = True,
+    runtime_settings: dict[str, str | int | None] | None = None,
 ) -> None:
+    settings = runtime_settings or load_runtime_settings()
     client = TelegramClient(token)
     if sync_commands_on_start:
         if sync_telegram_commands(client):
@@ -526,8 +528,8 @@ def run_telegram_bot(
             print("warning: telegram commands sync failed.")
     sessions: dict[int, CodingBot] = {}
     scheduler = DailyScheduler(
-        time_text=os.getenv("ABRAXAS_MEMORY_DAILY_SYNC_TIME", "02:00"),
-        tz_name=os.getenv("ABRAXAS_MEMORY_TZ", "Asia/Shanghai"),
+        time_text=str(settings.get("memory_daily_sync_time", "02:00")),
+        tz_name=str(settings.get("memory_tz", "Asia/Shanghai")),
     )
     offset: int | None = None
 
@@ -548,18 +550,17 @@ def run_telegram_bot(
 
 
 def main() -> None:
-    telegram_config = load_telegram_settings()
-    token = telegram_config["telegram_bot_token"]
+    settings = load_runtime_settings()
+    token = settings["telegram_bot_token"]
     if not token:
         print("Missing TELEGRAM_BOT_TOKEN")
         return
 
-    config = load_settings()
-    if not config["api_key"]:
+    if not settings["api_key"]:
         print("Missing API_KEY")
         return
 
-    raw_allowed = telegram_config["allowed_telegram_chat_ids"] or ""
+    raw_allowed = settings["allowed_telegram_chat_ids"] or ""
     allowed_chat_ids: set[int] | None = None
     if raw_allowed.strip():
         try:
@@ -574,10 +575,11 @@ def main() -> None:
 
     print("Starting Telegram bot polling...")
     run_telegram_bot(
-        token,
+        str(token),
         allowed_chat_ids=allowed_chat_ids,
         bot_factory=lambda: CodingBot(tool_registry=tool_registry),
         tool_registry=tool_registry,
+        runtime_settings=settings,
     )
 
 

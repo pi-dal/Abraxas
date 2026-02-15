@@ -1,17 +1,17 @@
-import os
 import re
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-DEFAULT_NOUS_PATH = "src/NOUS.md"
-DEFAULT_NOUS_TZ = "Asia/Shanghai"
+from .settings import DEFAULT_NOUS_PATH, DEFAULT_NOUS_TZ, load_runtime_settings
+
 REINFORCEMENT_SECTION = "NOUS Reinforcements"
 HABIT_SECTION = "User Habits (Persistent)"
 
 
 def resolve_nous_path(nous_path: str | None = None) -> Path:
-    raw = nous_path or os.getenv("ABRAXAS_NOUS_PATH", DEFAULT_NOUS_PATH)
+    runtime = load_runtime_settings()
+    raw = nous_path or str(runtime.get("nous_path", DEFAULT_NOUS_PATH))
     return Path(raw)
 
 
@@ -56,7 +56,8 @@ def append_nous_text(content: str, nous_path: str | None = None) -> str:
 
 
 def _now_text() -> str:
-    tz_name = os.getenv("ABRAXAS_NOUS_TZ", DEFAULT_NOUS_TZ)
+    runtime = load_runtime_settings()
+    tz_name = str(runtime.get("nous_tz", DEFAULT_NOUS_TZ))
     try:
         tz = ZoneInfo(tz_name)
     except Exception:
