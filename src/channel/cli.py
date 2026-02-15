@@ -14,6 +14,7 @@ from core.commands import (
     run_memory_command,
     run_new_session_command,
     run_nous_command,
+    run_photos_command,
     run_remember_command,
     run_tmux_plugin_command,
 )
@@ -115,6 +116,10 @@ def handle_cli_command(text: str, bot: CodingBot) -> tuple[bool, str, bool]:
     if command_text.startswith("/memory"):
         raw_args = command_text[len("/memory") :].strip()
         return True, run_memory_command(bot, raw_args), False
+
+    if command_text.startswith("/photos"):
+        raw_args = command_text[len("/photos") :].strip()
+        return True, run_photos_command(raw_args), False
 
     if command_text.startswith("/compact"):
         raw_args = command_text[len("/compact") :].strip()

@@ -36,6 +36,8 @@ SYSTEM_PROMPT = (
     "Distinguish tool source by tag: descriptions starting with [builtin] are built-in runtime tools; descriptions starting with [plugin] are external plugin tools. "
     "When reasoning about capabilities, treat [builtin] and [plugin] as separate groups. "
     "Telegram configuration can be extended through plugin tools that manage TELEGRAM_BOT_TOKEN and ALLOWED_TELEGRAM_CHAT_IDS in .env. "
+    "Image delivery is handled by channel runtime code: tool outputs should be structured metadata (paths/urls), and images are sent outside LLM text. "
+    "Do not place base64 image blobs into conversational messages. "
     "Use the bash tool when shell execution is needed. "
     "When task is done, return the final answer in plain text."
 )
@@ -326,15 +328,30 @@ class CodingBot:
     @staticmethod
     def _prepare_messages_for_api(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         prepared: list[dict[str, Any]] = []
+        system_index: int | None = None
+        pending_tool_call_ids: set[str] = set()
+
         for message in messages:
             role = str(message.get("role", "")).strip()
             if role not in {"system", "user", "assistant", "tool"}:
                 continue
 
-            entry: dict[str, Any] = {"role": role}
             content = message.get("content", "")
             if not isinstance(content, str):
                 content = str(content)
+
+            if role == "system":
+                pending_tool_call_ids.clear()
+                if system_index is None:
+                    prepared.append({"role": "system", "content": content})
+                    system_index = len(prepared) - 1
+                else:
+                    merged = str(prepared[system_index].get("content", ""))
+                    if content.strip():
+                        prepared[system_index]["content"] = f"{merged}\n\n{content}" if merged else content
+                continue
+
+            entry: dict[str, Any] = {"role": role}
 
             if role == "assistant":
                 tool_calls = message.get("tool_calls")
@@ -365,21 +382,31 @@ class CodingBot:
                         )
                     if normalized_calls:
                         entry["tool_calls"] = normalized_calls
-                        entry["content"] = content if content.strip() else None
+                        entry["content"] = content if content.strip() else ""
+                        pending_tool_call_ids = {
+                            str(item.get("id", "")).strip()
+                            for item in normalized_calls
+                            if str(item.get("id", "")).strip()
+                        }
                     else:
                         entry["content"] = content
+                        pending_tool_call_ids.clear()
                 else:
                     entry["content"] = content
+                    pending_tool_call_ids.clear()
             elif role == "tool":
-                entry["content"] = content
                 tool_call_id = str(message.get("tool_call_id", "")).strip()
-                if tool_call_id:
-                    entry["tool_call_id"] = tool_call_id
+                if not tool_call_id or tool_call_id not in pending_tool_call_ids:
+                    continue
+                entry["content"] = content
+                entry["tool_call_id"] = tool_call_id
                 tool_name = str(message.get("name", "")).strip()
                 if tool_name:
                     entry["name"] = tool_name
+                pending_tool_call_ids.discard(tool_call_id)
             else:
                 entry["content"] = content
+                pending_tool_call_ids.clear()
 
             prepared.append(entry)
         return prepared
@@ -394,6 +421,17 @@ class CodingBot:
             "too many tokens",
             "\"code\": \"1210\"",
             "'code': '1210'",
+        )
+        return any(marker in text for marker in markers)
+
+    @staticmethod
+    def _is_illegal_messages_error(exc: Exception) -> bool:
+        text = str(exc).lower()
+        markers = (
+            "messages parameter is illegal",
+            "\"code\": \"1214\"",
+            "'code': '1214'",
+            "invalid messages",
         )
         return any(marker in text for marker in markers)
 
@@ -416,6 +454,18 @@ class CodingBot:
                 self.messages = [self.messages[0]] + recent
                 return "session compacted: emergency trim for context overflow."
         return result
+
+    def _recover_from_illegal_messages(self) -> str:
+        repaired = self._prepare_messages_for_api(self.messages)
+        if not repaired:
+            self.messages = [{"role": "system", "content": build_system_prompt()}]
+            return "session repaired: reset to fresh prompt after illegal messages."
+        if repaired[0].get("role") != "system":
+            repaired.insert(0, {"role": "system", "content": build_system_prompt()})
+        if len(repaired) > 64:
+            repaired = [repaired[0]] + repaired[-63:]
+        self.messages = repaired
+        return "session repaired: normalized illegal message history."
 
     def _auto_compact_if_needed(self, next_user_text: str = "") -> str | None:
         max_tokens = getattr(self, "auto_compact_max_tokens", DEFAULT_AUTO_COMPACT_MAX_TOKENS)
@@ -491,6 +541,7 @@ class CodingBot:
                 pass
         self.messages.append({"role": "user", "content": user_text})
         overflow_retried = False
+        illegal_retried = False
         while True:
             try:
                 response = self.client.chat.completions.create(
@@ -504,6 +555,10 @@ class CodingBot:
                 if not overflow_retried and self._is_context_overflow_error(exc):
                     self._recover_from_context_overflow()
                     overflow_retried = True
+                    continue
+                if not illegal_retried and self._is_illegal_messages_error(exc):
+                    self._recover_from_illegal_messages()
+                    illegal_retried = True
                     continue
                 raise
             message = response.choices[0].message

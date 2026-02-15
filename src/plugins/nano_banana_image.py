@@ -23,6 +23,10 @@ SUPPORTED_MODES = {
 }
 
 
+def _json_result(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=True)
+
+
 def _resolve_mode(value: Any) -> str:
     text = str(value or "text_to_image").strip().lower().replace("-", "_")
     aliases = {
@@ -221,17 +225,18 @@ def _post_json(model: str, api_key: str, body: dict[str, Any], timeout_sec: int)
         return None, f"image generation error: invalid json response: {exc}"
 
 
-def _extract_output(payload: dict[str, Any], response_data: dict[str, Any], index: int = 1) -> str:
+def _extract_output(payload: dict[str, Any], response_data: dict[str, Any], index: int = 1) -> dict[str, Any]:
     candidates = response_data.get("candidates")
     if not isinstance(candidates, list) or not candidates:
-        return "image generation error: no candidates returned"
+        return {"ok": False, "error": "image generation error: no candidates returned", "images": []}
 
     parts = candidates[0].get("content", {}).get("parts", [])
     if not isinstance(parts, list):
         parts = []
 
-    output_lines: list[str] = []
-    image_saved = False
+    texts: list[str] = []
+    images: list[dict[str, str]] = []
+    errors: list[str] = []
     output_dir_raw = str(payload.get("output_dir", "")).strip() or "outputs/images"
     output_prefix = str(payload.get("output_prefix", "nano_banana")).strip() or "nano_banana"
     output_dir = Path(output_dir_raw) if output_dir_raw else None
@@ -242,7 +247,7 @@ def _extract_output(payload: dict[str, Any], response_data: dict[str, Any], inde
             continue
         text = part.get("text")
         if isinstance(text, str) and text.strip():
-            output_lines.append(f"text: {text.strip()}")
+            texts.append(text.strip())
 
         inline = part.get("inline_data") or part.get("inlineData")
         if isinstance(inline, dict):
@@ -254,72 +259,105 @@ def _extract_output(payload: dict[str, Any], response_data: dict[str, Any], inde
                     path = output_dir / f"{output_prefix}_{index}_{image_count}.png"
                     try:
                         path.write_bytes(base64.b64decode(data))
-                        output_lines.append(f"image_saved: {path}")
-                        image_saved = True
+                        images.append(
+                            {
+                                "index": str(image_count),
+                                "local_path": str(path.resolve()),
+                            }
+                        )
                     except Exception as exc:
-                        output_lines.append(f"image_save_error: {exc}")
+                        errors.append(f"image_save_error: {exc}")
                 else:
                     preview = data[:80]
-                    output_lines.append(f"image_base64_preview: {preview}...")
+                    images.append({"index": str(image_count), "base64_preview": f"{preview}..."})
 
     if image_count == 0:
-        if output_lines:
-            return "\n".join(output_lines)
-        return "image generation error: no image part in response"
+        if texts:
+            return {"ok": False, "error": "image generation error: no image part in response", "texts": texts, "images": []}
+        return {"ok": False, "error": "image generation error: no image part in response", "images": []}
 
-    if not output_lines:
-        return f"image generated: {image_count}"
-    if image_saved:
-        output_lines.append("status: ok")
-    return "\n".join(output_lines)
+    return {
+        "ok": len(errors) == 0,
+        "status": "ok" if len(errors) == 0 else "partial",
+        "images": images,
+        "texts": texts,
+        "errors": errors,
+    }
 
 
-def _run_single(payload: dict[str, Any], mode: str, api_key: str, model: str) -> str:
+def _run_single(payload: dict[str, Any], mode: str, api_key: str, model: str) -> dict[str, Any]:
     prompt = str(payload.get("prompt", "")).strip()
     body, error = _build_single_request(payload, mode, prompt)
     if error:
-        return error
+        return {"ok": False, "error": error, "mode": mode}
 
     timeout_sec = _read_int(payload, "timeout_sec", 90, 10, 300)
     response_data, request_error = _post_json(model, api_key, body, timeout_sec)
     if request_error:
-        return request_error
+        return {"ok": False, "error": request_error, "mode": mode}
     if response_data is None:
-        return "image generation error: empty response"
-    return _extract_output(payload, response_data, index=1)
+        return {"ok": False, "error": "image generation error: empty response", "mode": mode}
+    result = _extract_output(payload, response_data, index=1)
+    result["mode"] = mode
+    result["model"] = model
+    return result
 
 
-def _run_batch(payload: dict[str, Any], api_key: str, model: str) -> str:
+def _run_batch(payload: dict[str, Any], api_key: str, model: str) -> dict[str, Any]:
     prompts = _as_list_of_strings(payload.get("prompts", []))
     fallback_prompt = str(payload.get("prompt", "")).strip()
     count = _read_int(payload, "batch_count", 1, 1, 8)
 
     if not prompts:
         if not fallback_prompt:
-            return "image generation error: batch_generate requires prompts[] or prompt"
+            return {
+                "ok": False,
+                "error": "image generation error: batch_generate requires prompts[] or prompt",
+                "mode": "batch_generate",
+            }
         prompts = [fallback_prompt for _ in range(count)]
 
-    outputs: list[str] = []
+    results: list[dict[str, Any]] = []
+    all_images: list[dict[str, str]] = []
+    errors: list[str] = []
     for index, prompt in enumerate(prompts, start=1):
         child_payload = dict(payload)
         child_payload["prompt"] = prompt
         body, error = _build_single_request(child_payload, "text_to_image", prompt)
         if error:
-            outputs.append(f"batch[{index}] {error}")
+            err = f"batch[{index}] {error}"
+            errors.append(err)
+            results.append({"index": index, "ok": False, "error": err})
             continue
 
         timeout_sec = _read_int(payload, "timeout_sec", 90, 10, 300)
         response_data, request_error = _post_json(model, api_key, body, timeout_sec)
         if request_error:
-            outputs.append(f"batch[{index}] {request_error}")
+            err = f"batch[{index}] {request_error}"
+            errors.append(err)
+            results.append({"index": index, "ok": False, "error": err})
             continue
         if response_data is None:
-            outputs.append(f"batch[{index}] image generation error: empty response")
+            err = f"batch[{index}] image generation error: empty response"
+            errors.append(err)
+            results.append({"index": index, "ok": False, "error": err})
             continue
         result = _extract_output(payload, response_data, index=index)
-        outputs.append(f"batch[{index}] {result}")
+        results.append({"index": index, **result})
+        for image in result.get("images", []):
+            if isinstance(image, dict):
+                all_images.append(image)
+        for err in result.get("errors", []):
+            errors.append(str(err))
 
-    return "\n".join(outputs)
+    return {
+        "ok": len(errors) == 0,
+        "mode": "batch_generate",
+        "model": model,
+        "results": results,
+        "images": all_images,
+        "errors": errors,
+    }
 
 
 def _handle(payload: dict[str, Any]) -> str:
@@ -327,19 +365,25 @@ def _handle(payload: dict[str, Any]) -> str:
         mode = _resolve_mode(payload.get("mode"))
         if mode not in SUPPORTED_MODES:
             supported = ", ".join(sorted(SUPPORTED_MODES))
-            return f"image generation error: unsupported mode '{mode}'. supported: {supported}"
+            return _json_result(
+                {
+                    "ok": False,
+                    "error": f"image generation error: unsupported mode '{mode}'. supported: {supported}",
+                    "mode": mode,
+                }
+            )
 
         api_key = _resolve_api_key(payload)
         if not api_key:
-            return "image generation error: missing GEMINI_API_KEY"
+            return _json_result({"ok": False, "error": "image generation error: missing GEMINI_API_KEY", "mode": mode})
 
         model = _resolve_model(payload)
 
         if mode == "batch_generate":
-            return _run_batch(payload, api_key, model)
-        return _run_single(payload, mode, api_key, model)
+            return _json_result(_run_batch(payload, api_key, model))
+        return _json_result(_run_single(payload, mode, api_key, model))
     except Exception as exc:
-        return f"image generation error: {exc}"
+        return _json_result({"ok": False, "error": f"image generation error: {exc}"})
 
 
 def register(registry) -> None:

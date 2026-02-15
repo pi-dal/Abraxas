@@ -3,6 +3,7 @@ import pathlib
 import sys
 import tempfile
 import unittest
+import json
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "src"))
 
@@ -191,7 +192,13 @@ class TelegramBotTests(unittest.TestCase):
                     on_tool_result(
                         "nano_banana_image",
                         '{"mode":"text_to_image"}',
-                        f"image_saved: {self.image_path}\nstatus: ok",
+                        json.dumps(
+                            {
+                                "ok": True,
+                                "mode": "text_to_image",
+                                "images": [{"local_path": self.image_path}],
+                            }
+                        ),
                     )
                 return "image generated."
 
@@ -214,9 +221,11 @@ class TelegramBotTests(unittest.TestCase):
                 {7},
             )
 
-            self.assertIn("image generated.", client.sent[-1]["text"])
+            self.assertIn("image generated.", client.sent[0]["text"])
             self.assertEqual(len(client.photos), 1)
             self.assertEqual(client.photos[0]["photo"], image_path)
+            self.assertIn("image addresses", client.sent[-1]["text"])
+            self.assertIn(image_path, client.sent[-1]["text"])
 
     def test_process_update_photo_caption_routes_to_nano_banana_plugin(self):
         class _PhotoRegistry:
@@ -229,7 +238,13 @@ class TelegramBotTests(unittest.TestCase):
 
             def call(self, name, arguments):
                 self.calls.append((name, arguments))
-                return f"image_saved: {self.generated_image_path}\nstatus: ok"
+                return json.dumps(
+                    {
+                        "ok": True,
+                        "mode": "image_edit",
+                        "images": [{"local_path": self.generated_image_path}],
+                    }
+                )
 
         class _PhotoBot(_FakeBot):
             def __init__(self, generated_image_path):
@@ -278,6 +293,8 @@ class TelegramBotTests(unittest.TestCase):
             self.assertIn('"input_image"', arguments)
             self.assertEqual(len(client.photos), 1)
             self.assertEqual(client.photos[0]["photo"], generated_path)
+            self.assertIn("image addresses", client.sent[-1]["text"])
+            self.assertIn(generated_path, client.sent[-1]["text"])
 
     def test_process_update_photo_without_caption_prompts_for_edit_text(self):
         bot = _FakeBot()
@@ -301,6 +318,46 @@ class TelegramBotTests(unittest.TestCase):
 
         self.assertTrue(client.sent)
         self.assertIn("photo received", client.sent[-1]["text"])
+
+    def test_process_update_photos_sends_recent_images(self):
+        previous_cwd = os.getcwd()
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                os.chdir(td)
+                images_dir = os.path.join(td, "outputs", "images")
+                os.makedirs(images_dir, exist_ok=True)
+                old_path = os.path.join(images_dir, "old.png")
+                new_path = os.path.join(images_dir, "new.png")
+                with open(old_path, "wb") as f:
+                    f.write(b"old")
+                with open(new_path, "wb") as f:
+                    f.write(b"new")
+                os.utime(old_path, (1, 1))
+                os.utime(new_path, (2, 2))
+
+                sessions = {7: _FakeBot()}
+                client = _FakeClient()
+                process_update(
+                    {
+                        "update_id": 103,
+                        "message": {
+                            "message_id": 58,
+                            "chat": {"id": 7},
+                            "text": f"/photos {new_path}",
+                        },
+                    },
+                    sessions,
+                    client,
+                    lambda: _FakeBot(),
+                    {7},
+                )
+
+                self.assertEqual(len(client.photos), 1)
+                self.assertEqual(client.photos[0]["photo"], new_path)
+                self.assertIn("image addresses", client.sent[-1]["text"])
+                self.assertIn(new_path, client.sent[-1]["text"])
+        finally:
+            os.chdir(previous_cwd)
 
     def test_process_update_help_mentions_compact(self):
         sessions = {}
@@ -419,6 +476,7 @@ class TelegramBotTests(unittest.TestCase):
         self.assertIn("tmux", names)
         self.assertIn("memory", names)
         self.assertIn("new", names)
+        self.assertIn("photos", names)
 
     def test_process_update_new_resets_chat_session(self):
         old_bot = _FakeBot()

@@ -7,10 +7,12 @@ from core.bot import CodingBot
 from core.commands import (
     build_commands_text,
     build_help_text,
+    resolve_recent_photo_paths,
     run_compact_command,
     run_memory_command,
     run_new_session_command,
     run_nous_command,
+    run_photos_command,
     run_remember_command,
     run_tmux_plugin_command,
 )
@@ -109,12 +111,96 @@ def extract_image_saved_paths(text: str) -> list[str]:
     return result
 
 
+def parse_image_tool_payload(text: str) -> dict[str, Any] | None:
+    if not text:
+        return None
+    try:
+        obj = json.loads(str(text))
+    except Exception:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    return obj
+
+
+def extract_image_paths_and_urls(text: str) -> tuple[list[str], list[str]]:
+    payload = parse_image_tool_payload(text)
+    paths: list[str] = []
+    urls: list[str] = []
+
+    if isinstance(payload, dict):
+        raw_images = payload.get("images")
+        if isinstance(raw_images, list):
+            for item in raw_images:
+                if not isinstance(item, dict):
+                    continue
+                local_path = str(item.get("local_path", "")).strip()
+                if local_path:
+                    paths.append(local_path)
+                public_url = str(item.get("public_url", "")).strip()
+                if public_url:
+                    urls.append(public_url)
+
+        raw_results = payload.get("results")
+        if isinstance(raw_results, list):
+            for result in raw_results:
+                if not isinstance(result, dict):
+                    continue
+                images = result.get("images")
+                if not isinstance(images, list):
+                    continue
+                for item in images:
+                    if not isinstance(item, dict):
+                        continue
+                    local_path = str(item.get("local_path", "")).strip()
+                    if local_path:
+                        paths.append(local_path)
+                    public_url = str(item.get("public_url", "")).strip()
+                    if public_url:
+                        urls.append(public_url)
+
+    if not paths:
+        paths.extend(extract_image_saved_paths(text))
+
+    dedup_paths: list[str] = []
+    seen_paths: set[str] = set()
+    for path in paths:
+        if path in seen_paths:
+            continue
+        seen_paths.add(path)
+        dedup_paths.append(path)
+
+    dedup_urls: list[str] = []
+    seen_urls: set[str] = set()
+    for url in urls:
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        dedup_urls.append(url)
+
+    return dedup_paths, dedup_urls
+
+
+def format_image_tool_summary(text: str) -> str:
+    payload = parse_image_tool_payload(text)
+    if not isinstance(payload, dict):
+        return str(text)
+    if not bool(payload.get("ok", False)):
+        error = str(payload.get("error", "")).strip() or "image generation failed."
+        return error
+    paths, _ = extract_image_paths_and_urls(text)
+    mode = str(payload.get("mode", "image")).strip()
+    return f"{mode} done: {len(paths)} image(s) generated."
+
+
 def send_generated_images_from_paths(
     client: TelegramClient,
     chat_id: int,
     message_id: int,
     image_paths: list[str],
+    image_urls: list[str] | None = None,
 ) -> None:
+    sent_paths: list[str] = []
     seen: set[str] = set()
     for image_path in image_paths:
         if image_path in seen:
@@ -135,12 +221,27 @@ def send_generated_images_from_paths(
                 caption=f"generated image\nsource: {resolved}",
                 reply_to_message_id=message_id,
             )
+            sent_paths.append(str(resolved))
         except Exception as exc:
             client.send_message(
                 chat_id,
                 f"image send error: {exc}",
                 reply_to_message_id=message_id,
             )
+
+    address_lines: list[str] = []
+    if sent_paths:
+        address_lines.append("image addresses:")
+        for path in sent_paths:
+            address_lines.append(f"- {path}")
+    for url in image_urls or []:
+        address_lines.append(f"- {url}")
+    if address_lines:
+        client.send_message(
+            chat_id,
+            "\n".join(address_lines),
+            reply_to_message_id=message_id,
+        )
 
 
 def process_update(
@@ -192,6 +293,25 @@ def process_update(
                 chunk,
                 reply_to_message_id=message_id if index == 0 else None,
             )
+        return
+
+    if text.startswith("/photos"):
+        raw = text[len("/photos") :].strip()
+        image_paths, image_error = resolve_recent_photo_paths(raw)
+        if image_error:
+            client.send_message(
+                chat_id,
+                run_photos_command(raw),
+                reply_to_message_id=message_id,
+            )
+            return
+        send_generated_images_from_paths(
+            client,
+            chat_id,
+            message_id,
+            image_paths,
+            [],
+        )
         return
 
     if text.startswith("/nous"):
@@ -357,18 +477,21 @@ def process_update(
         if plugin_out.startswith("unknown tool:"):
             plugin_out = "image edit unavailable: install/enable src/plugins/nano_banana_image.py"
 
-        chunks = chunk_message(plugin_out or "(empty response)")
+        summary_text = format_image_tool_summary(plugin_out or "")
+        chunks = chunk_message(summary_text or "(empty response)")
         for index, chunk in enumerate(chunks):
             client.send_message(
                 chat_id,
                 chunk,
                 reply_to_message_id=message_id if index == 0 else None,
             )
+        image_paths, image_urls = extract_image_paths_and_urls(plugin_out)
         send_generated_images_from_paths(
             client,
             chat_id,
             message_id,
-            extract_image_saved_paths(plugin_out),
+            image_paths,
+            image_urls,
         )
         return
 
@@ -378,11 +501,14 @@ def process_update(
         sessions[chat_id] = bot
 
     generated_image_paths: list[str] = []
+    generated_image_urls: list[str] = []
 
     def _on_tool_result(name: str, _arguments: str, output: str) -> None:
         if name != "nano_banana_image":
             return
-        generated_image_paths.extend(extract_image_saved_paths(output))
+        paths, urls = extract_image_paths_and_urls(output)
+        generated_image_paths.extend(paths)
+        generated_image_urls.extend(urls)
 
     try:
         try:
@@ -405,4 +531,5 @@ def process_update(
         chat_id,
         message_id,
         generated_image_paths,
+        generated_image_urls,
     )

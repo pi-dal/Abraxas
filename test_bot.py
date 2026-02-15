@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import os
 import pathlib
 import sys
@@ -568,12 +569,78 @@ class BotTests(unittest.TestCase):
 
         out = core_bot.CodingBot._prepare_messages_for_api(messages)
         self.assertEqual(out[1]["role"], "assistant")
-        self.assertIsNone(out[1]["content"])
+        self.assertEqual(out[1]["content"], "")
         self.assertEqual(out[1]["tool_calls"][0]["function"]["name"], "nano_banana_image")
         self.assertIsInstance(out[1]["tool_calls"][0]["function"]["arguments"], str)
         self.assertEqual(out[2]["role"], "tool")
         self.assertEqual(out[2]["name"], "nano_banana_image")
         self.assertEqual(out[2]["tool_call_id"], "call_1")
+
+    def test_prepare_messages_for_api_merges_system_and_drops_orphan_tool(self):
+        messages = [
+            {"role": "system", "content": "base system"},
+            {"role": "system", "content": "memory brief"},
+            {"role": "tool", "tool_call_id": "orphan", "name": "bash", "content": "x"},
+            {"role": "user", "content": "hello"},
+        ]
+        out = core_bot.CodingBot._prepare_messages_for_api(messages)
+        self.assertEqual(len(out), 2)
+        self.assertEqual(out[0]["role"], "system")
+        self.assertIn("base system", out[0]["content"])
+        self.assertIn("memory brief", out[0]["content"])
+        self.assertEqual(out[1]["role"], "user")
+
+    def test_ask_retries_once_on_illegal_messages_error(self):
+        class _FakeToolRegistry:
+            def tool_specs(self):
+                return []
+
+            def call(self, name, arguments):
+                _ = (name, arguments)
+                return ""
+
+        class _Message:
+            def __init__(self, content: str):
+                self.content = content
+                self.tool_calls = []
+
+        class _Response:
+            def __init__(self, content: str):
+                self.choices = [SimpleNamespace(message=_Message(content))]
+
+        class _Completions:
+            def __init__(self):
+                self.calls = 0
+
+            def create(self, **kwargs):
+                _ = kwargs
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError(
+                        "Error code: 400 - {'error': {'code': '1214', 'message': "
+                        "'The messages parameter is illegal. Please check the documentation.'}}"
+                    )
+                return _Response("ok-illegal-fixed")
+
+        completions = _Completions()
+        bot = core_bot.CodingBot.__new__(core_bot.CodingBot)
+        bot.client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+        bot.model = "glm-4.7"
+        bot.tool_registry = _FakeToolRegistry()
+        bot.memory_runtime = None
+        bot.auto_braindump_enabled = False
+        bot.auto_compact_max_tokens = 0
+        bot.auto_compact_keep_last_messages = 2
+        bot.auto_compact_instructions = None
+        bot.messages = [
+            {"role": "system", "content": "sys-base"},
+            {"role": "system", "content": "memory-brief"},
+            {"role": "tool", "tool_call_id": "orphan", "name": "bash", "content": "orphan"},
+        ]
+
+        out = core_bot.CodingBot.ask(bot, "make it work")
+        self.assertEqual(out, "ok-illegal-fixed")
+        self.assertEqual(completions.calls, 2)
 
     def test_ask_retries_once_on_context_overflow(self):
         class _FakeToolRegistry:
@@ -1008,6 +1075,30 @@ class BotTests(unittest.TestCase):
         self.assertIn("list", bot.tool_registry.calls[0][1])
         self.assertIn("tmux sessions", out)
 
+    def test_cli_photos_command_lists_recent_images(self):
+        previous_cwd = os.getcwd()
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                os.chdir(td)
+                images_dir = os.path.join(td, "outputs", "images")
+                os.makedirs(images_dir, exist_ok=True)
+                old_path = os.path.join(images_dir, "a.png")
+                new_path = os.path.join(images_dir, "b.png")
+                with open(old_path, "wb") as f:
+                    f.write(b"a")
+                with open(new_path, "wb") as f:
+                    f.write(b"b")
+                os.utime(old_path, (1, 1))
+                os.utime(new_path, (2, 2))
+
+                handled, out, should_exit = handle_cli_command(f"/photos {new_path}", self._FakeCliBot())
+                self.assertTrue(handled)
+                self.assertFalse(should_exit)
+                self.assertIn("recent photos", out)
+                self.assertIn(new_path, out)
+        finally:
+            os.chdir(previous_cwd)
+
     def test_cli_new_command_starts_new_session(self):
         bot = self._FakeCliBot()
         handled, out, should_exit = handle_cli_command("/new", bot)
@@ -1165,11 +1256,23 @@ class BotTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as td:
                 os.chdir(td)
                 out = nano_banana_image._extract_output({}, response_data, index=1)
-                self.assertIn("image_saved:", out)
+                self.assertTrue(out.get("ok"))
+                self.assertTrue(out.get("images"))
                 expected = os.path.join(td, "outputs", "images", "nano_banana_1_1.png")
                 self.assertTrue(os.path.exists(expected))
+                self.assertEqual(
+                    os.path.realpath(out["images"][0].get("local_path", "")),
+                    os.path.realpath(expected),
+                )
         finally:
             os.chdir(previous_cwd)
+
+    def test_nano_banana_handle_returns_structured_json(self):
+        nano_banana_image = self._load_nano_banana_plugin_module()
+        out = nano_banana_image._handle({"mode": "text_to_image"})
+        payload = json.loads(out)
+        self.assertIn("ok", payload)
+        self.assertIn("error", payload)
 
     def test_skill_installer_mentions_current_entrypoints(self):
         skill_path = pathlib.Path(__file__).resolve().parent / "src" / "skills" / "skill-installer.md"

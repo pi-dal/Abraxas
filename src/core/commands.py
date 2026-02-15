@@ -14,6 +14,7 @@ from .skills import DEFAULT_SKILLS_DIR, SUPPORTED_SKILL_EXTENSIONS
 DEFAULT_TELEGRAM_COMMANDS = [
     {"command": "help", "description": "intro and how to chat"},
     {"command": "commands", "description": "show commands, tools, plugins, skills"},
+    {"command": "photos", "description": "send photo(s) by local path"},
     {"command": "memory", "description": "inspect or sync memory/mission"},
     {"command": "compact", "description": "compact current chat session"},
     {"command": "new", "description": "start a fresh chat session"},
@@ -33,6 +34,8 @@ def build_help_text(commands: list[dict[str, str]] | None = None) -> str:
         "Talk to me in normal language: goals, bugs, architecture, or raw ideas.",
         "I will reason, run tools when needed, and answer directly.",
         "Use /commands to inspect command menu, built-in tools, plugins, and skills.",
+        "Use /photos <local_path>[,<local_path2>] to send existing local images.",
+        "Use /photos with no path to resend recent generated images.",
         "Use /new to start a fresh conversation in this chat.",
         "Use /memory to inspect status or run memory/mission sync.",
         "Use /tmux to list/create/send/log/kill tmux sessions for coding agents.",
@@ -137,6 +140,64 @@ def _resolve_skills_dir(skills_dir: str) -> Path:
     if path.is_absolute():
         return path
     return Path.cwd() / path
+
+
+def list_recent_photo_paths(limit: int = 3, search_dir: str = "outputs/images") -> list[str]:
+    root = Path(search_dir)
+    if not root.is_absolute():
+        root = Path.cwd() / root
+    if not root.exists() or not root.is_dir():
+        return []
+    suffixes = {".png", ".jpg", ".jpeg", ".webp"}
+    files = [
+        item for item in root.iterdir() if item.is_file() and item.suffix.lower() in suffixes
+    ]
+    files.sort(key=lambda item: item.stat().st_mtime, reverse=True)
+    return [str(item.resolve()) for item in files[:limit]]
+
+
+def resolve_recent_photo_paths(
+    raw_args: str,
+    *,
+    search_dir: str = "outputs/images",
+) -> tuple[list[str], str | None]:
+    raw = (raw_args or "").strip()
+    if not raw:
+        paths = list_recent_photo_paths(limit=3, search_dir=search_dir)
+        if not paths:
+            return [], f"no photos found in {Path(search_dir).as_posix()}"
+        return paths, None
+
+    if raw in {"help", "-h", "--help"}:
+        return [], "photos usage: /photos <local_path>[,<local_path2>]"
+
+    raw_items = [part.strip() for part in raw.split(",") if part.strip()]
+    if not raw_items:
+        return [], "photos error: usage /photos <local_path>[,<local_path2>]"
+
+    paths: list[str] = []
+    missing: list[str] = []
+    for item in raw_items:
+        path = Path(item).expanduser()
+        if not path.is_absolute():
+            path = (Path.cwd() / path).resolve()
+        if path.exists() and path.is_file():
+            paths.append(str(path))
+        else:
+            missing.append(item)
+
+    if missing:
+        return [], "photos error: path not found: " + ", ".join(missing)
+    if not paths:
+        return [], "photos error: no valid local photo path provided"
+    return paths, None
+
+
+def run_photos_command(raw_args: str, *, search_dir: str = "outputs/images") -> str:
+    paths, error = resolve_recent_photo_paths(raw_args, search_dir=search_dir)
+    if error:
+        return error
+    return "recent photos:\n" + "\n".join(f"- {path}" for path in paths)
 
 
 def list_skill_files(skills_dir: str | None = None) -> list[str]:
