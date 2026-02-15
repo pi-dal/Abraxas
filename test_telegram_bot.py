@@ -23,6 +23,7 @@ class _FakeClient:
     def __init__(self):
         self.sent = []
         self.commands_synced = []
+        self.photos = []
 
     def send_message(self, chat_id, text, reply_to_message_id=None):
         self.sent.append(
@@ -36,6 +37,17 @@ class _FakeClient:
     def set_my_commands(self, commands):
         self.commands_synced.append(commands)
         return True
+
+    def send_photo(self, chat_id, photo, caption=None, reply_to_message_id=None):
+        self.photos.append(
+            {
+                "chat_id": chat_id,
+                "photo": photo,
+                "caption": caption,
+                "reply_to_message_id": reply_to_message_id,
+            }
+        )
+        return {"ok": True}
 
 
 class _FakeBot:
@@ -159,6 +171,45 @@ class TelegramBotTests(unittest.TestCase):
         self.assertEqual(client.sent[1]["text"], "echo:B")
         self.assertEqual(client.sent[0]["reply_to_message_id"], 11)
 
+    def test_process_update_sends_generated_image_from_tool_output(self):
+        class _PhotoBot(_FakeBot):
+            def __init__(self, image_path):
+                super().__init__()
+                self.image_path = image_path
+
+            def ask(self, text, on_tool_result=None):
+                _ = text
+                if on_tool_result is not None:
+                    on_tool_result(
+                        "nano_banana_image",
+                        '{"mode":"text_to_image"}',
+                        f"image_saved: {self.image_path}\nstatus: ok",
+                    )
+                return "image generated."
+
+        with tempfile.TemporaryDirectory() as td:
+            image_path = os.path.join(td, "photo.png")
+            with open(image_path, "wb") as f:
+                f.write(b"fake-image")
+
+            bot = _PhotoBot(image_path)
+            sessions = {7: bot}
+            client = _FakeClient()
+            process_update(
+                {
+                    "update_id": 100,
+                    "message": {"message_id": 55, "chat": {"id": 7}, "text": "draw a cat"},
+                },
+                sessions,
+                client,
+                lambda: _FakeBot(),
+                {7},
+            )
+
+            self.assertIn("image generated.", client.sent[-1]["text"])
+            self.assertEqual(len(client.photos), 1)
+            self.assertEqual(client.photos[0]["photo"], image_path)
+
     def test_process_update_help_mentions_compact(self):
         sessions = {}
         client = _FakeClient()
@@ -275,6 +326,34 @@ class TelegramBotTests(unittest.TestCase):
         names = [item["command"] for item in DEFAULT_TELEGRAM_COMMANDS]
         self.assertIn("tmux", names)
         self.assertIn("memory", names)
+        self.assertIn("new", names)
+
+    def test_process_update_new_resets_chat_session(self):
+        old_bot = _FakeBot()
+        sessions = {7: old_bot}
+        client = _FakeClient()
+        created: list[_FakeBot] = []
+
+        def factory():
+            bot = _FakeBot()
+            created.append(bot)
+            return bot
+
+        process_update(
+            {
+                "update_id": 66,
+                "message": {"message_id": 35, "chat": {"id": 7}, "text": "/new"},
+            },
+            sessions,
+            client,
+            factory,
+            {7},
+        )
+
+        self.assertEqual(len(created), 1)
+        self.assertIsNot(sessions[7], old_bot)
+        self.assertIs(sessions[7], created[0])
+        self.assertIn("new session started", client.sent[-1]["text"])
 
     def test_process_update_tmux_command(self):
         bot = _FakeBot()

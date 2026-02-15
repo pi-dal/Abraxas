@@ -232,7 +232,7 @@ def _extract_output(payload: dict[str, Any], response_data: dict[str, Any], inde
 
     output_lines: list[str] = []
     image_saved = False
-    output_dir_raw = str(payload.get("output_dir", "")).strip()
+    output_dir_raw = str(payload.get("output_dir", "")).strip() or "outputs/images"
     output_prefix = str(payload.get("output_prefix", "nano_banana")).strip() or "nano_banana"
     output_dir = Path(output_dir_raw) if output_dir_raw else None
 

@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Callable
 
 from openai import OpenAI
 from typing import Protocol
@@ -273,6 +273,19 @@ class CodingBot:
             f"kept {len(self.messages) - 2} recent message(s) plus summary."
         )
 
+    def start_new_session(self) -> str:
+        config = load_runtime_settings()
+        self.messages = [{"role": "system", "content": build_system_prompt(settings=config)}]
+        runtime = getattr(self, "memory_runtime", None)
+        if runtime is not None:
+            try:
+                memory_brief = runtime.load_memory_brief()
+            except Exception:
+                memory_brief = ""
+            if memory_brief:
+                self.messages.append({"role": "system", "content": f"[memory_brief]\n{memory_brief}"})
+        return "new session started."
+
     def _estimate_message_tokens(self, messages: list[dict[str, Any]]) -> int:
         total_chars = 0
         for message in messages:
@@ -336,7 +349,12 @@ class CodingBot:
         except Exception:
             return None
 
-    def ask(self, user_text: str, on_tool=None) -> str:
+    def ask(
+        self,
+        user_text: str,
+        on_tool=None,
+        on_tool_result: Callable[[str, str, str], None] | None = None,
+    ) -> str:
         self._auto_capture_braindump_if_needed(user_text)
         self._auto_compact_if_needed(user_text)
         runtime = getattr(self, "memory_runtime", None)
@@ -369,12 +387,21 @@ class CodingBot:
             for tool_call in tool_calls:
                 if on_tool:
                     on_tool(tool_label(tool_call.function.name, tool_call.function.arguments))
+                tool_output = str(
+                    self.tool_registry.call(
+                        tool_call.function.name, tool_call.function.arguments
+                    )
+                )
+                if on_tool_result:
+                    on_tool_result(
+                        tool_call.function.name,
+                        tool_call.function.arguments,
+                        tool_output,
+                    )
                 self.messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": tool_call.id,
-                        "content": self.tool_registry.call(
-                            tool_call.function.name, tool_call.function.arguments
-                        ),
+                        "content": tool_output,
                     }
                 )

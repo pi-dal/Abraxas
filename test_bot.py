@@ -82,9 +82,14 @@ class BotTests(unittest.TestCase):
         def __init__(self):
             self.tool_registry = BotTests._FakeToolRegistry()
             self.remember_calls: list[tuple[str, list[str]]] = []
+            self.new_session_calls = 0
 
         def compact_session(self, keep_last_messages=12, instructions=None):
             return f"compacted:{keep_last_messages}:{instructions or ''}"
+
+        def start_new_session(self):
+            self.new_session_calls += 1
+            return "new session started."
 
         def remember(self, note, tags=None):
             clean_tags = tags or []
@@ -181,6 +186,7 @@ class BotTests(unittest.TestCase):
         self.assertTrue(hasattr(core_commands, "build_commands_text"))
         self.assertTrue(hasattr(core_commands, "run_memory_command"))
         self.assertTrue(hasattr(core_commands, "run_tmux_plugin_command"))
+        self.assertTrue(hasattr(core_commands, "run_new_session_command"))
 
     def test_settings_use_single_runtime_loader(self):
         self.assertFalse(hasattr(core_settings, "load_settings"))
@@ -829,6 +835,14 @@ class BotTests(unittest.TestCase):
         self.assertIn("list", bot.tool_registry.calls[0][1])
         self.assertIn("tmux sessions", out)
 
+    def test_cli_new_command_starts_new_session(self):
+        bot = self._FakeCliBot()
+        handled, out, should_exit = handle_cli_command("/new", bot)
+        self.assertTrue(handled)
+        self.assertFalse(should_exit)
+        self.assertEqual(bot.new_session_calls, 1)
+        self.assertIn("new session started", out)
+
     def test_cli_memory_status_command(self):
         class _Memory:
             def qmd_status(self):
@@ -953,6 +967,36 @@ class BotTests(unittest.TestCase):
         self.assertIsNone(err)
         self.assertIn("tools", body)
         self.assertEqual(body["tools"], [{"google_search": {}}])
+
+    def test_nano_banana_extract_output_defaults_output_dir(self):
+        nano_banana_image = self._load_nano_banana_plugin_module()
+        response_data = {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {
+                                "inline_data": {
+                                    "mime_type": "image/png",
+                                    "data": "aGVsbG8=",
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+
+        previous_cwd = os.getcwd()
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                os.chdir(td)
+                out = nano_banana_image._extract_output({}, response_data, index=1)
+                self.assertIn("image_saved:", out)
+                expected = os.path.join(td, "outputs", "images", "nano_banana_1_1.png")
+                self.assertTrue(os.path.exists(expected))
+        finally:
+            os.chdir(previous_cwd)
 
     def test_skill_installer_mentions_current_entrypoints(self):
         skill_path = pathlib.Path(__file__).resolve().parent / "src" / "skills" / "skill-installer.md"

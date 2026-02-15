@@ -12,6 +12,7 @@ from core.commands import (
     build_help_text,
     run_compact_command,
     run_memory_command,
+    run_new_session_command,
     run_nous_command,
     run_remember_command,
     run_tmux_plugin_command,
@@ -118,6 +119,9 @@ def handle_cli_command(text: str, bot: CodingBot) -> tuple[bool, str, bool]:
     if command_text.startswith("/compact"):
         raw_args = command_text[len("/compact") :].strip()
         return True, run_compact_command(bot, raw_args), False
+
+    if command_text.startswith("/new"):
+        return True, run_new_session_command(bot), False
 
     if command_text.startswith("/remember"):
         raw = command_text[len("/remember") :].strip()

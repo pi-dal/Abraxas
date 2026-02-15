@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import Any
 
 from core.bot import CodingBot
@@ -6,6 +7,7 @@ from core.commands import (
     build_help_text,
     run_compact_command,
     run_memory_command,
+    run_new_session_command,
     run_nous_command,
     run_remember_command,
     run_tmux_plugin_command,
@@ -62,6 +64,21 @@ def chunk_message(text: str, limit: int = 4096) -> list[str]:
     if current:
         chunks.append(current)
     return chunks
+
+
+def extract_image_saved_paths(text: str) -> list[str]:
+    result: list[str] = []
+    if not text:
+        return result
+    marker = "image_saved:"
+    for raw_line in str(text).splitlines():
+        line = raw_line.strip()
+        if not line.startswith(marker):
+            continue
+        path_text = line[len(marker) :].strip()
+        if path_text:
+            result.append(path_text)
+    return result
 
 
 def process_update(
@@ -207,13 +224,41 @@ def process_update(
         )
         return
 
+    if text.startswith("/new"):
+        bot = sessions.get(chat_id)
+        if bot is None:
+            bot = bot_factory()
+            sessions[chat_id] = bot
+
+        new_result = run_new_session_command(bot)
+        if new_result == "new session unavailable":
+            sessions[chat_id] = bot_factory()
+            new_result = "new session started."
+
+        client.send_message(
+            chat_id,
+            new_result,
+            reply_to_message_id=message_id,
+        )
+        return
+
     bot = sessions.get(chat_id)
     if bot is None:
         bot = bot_factory()
         sessions[chat_id] = bot
 
+    generated_image_paths: list[str] = []
+
+    def _on_tool_result(name: str, _arguments: str, output: str) -> None:
+        if name != "nano_banana_image":
+            return
+        generated_image_paths.extend(extract_image_saved_paths(output))
+
     try:
-        reply = bot.ask(text)
+        try:
+            reply = bot.ask(text, on_tool_result=_on_tool_result)
+        except TypeError:
+            reply = bot.ask(text)
     except Exception as exc:
         reply = f"bot error: {exc}"
 
@@ -224,3 +269,30 @@ def process_update(
             chunk,
             reply_to_message_id=message_id if index == 0 else None,
         )
+
+    seen: set[str] = set()
+    for image_path in generated_image_paths:
+        if image_path in seen:
+            continue
+        seen.add(image_path)
+        resolved = Path(image_path).expanduser()
+        if not resolved.exists() or not resolved.is_file():
+            client.send_message(
+                chat_id,
+                f"image send skipped: file not found: {resolved}",
+                reply_to_message_id=message_id,
+            )
+            continue
+        try:
+            client.send_photo(
+                chat_id,
+                str(resolved),
+                caption=f"generated image\nsource: {resolved}",
+                reply_to_message_id=message_id,
+            )
+        except Exception as exc:
+            client.send_message(
+                chat_id,
+                f"image send error: {exc}",
+                reply_to_message_id=message_id,
+            )

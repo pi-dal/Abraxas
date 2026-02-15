@@ -16,6 +16,7 @@ DEFAULT_TELEGRAM_COMMANDS = [
     {"command": "commands", "description": "show commands, tools, plugins, skills"},
     {"command": "memory", "description": "inspect or sync memory/mission"},
     {"command": "compact", "description": "compact current chat session"},
+    {"command": "new", "description": "start a fresh chat session"},
     {"command": "remember", "description": "save a note to memory"},
     {"command": "nous", "description": "show or reinforce NOUS profile"},
     {"command": "tmux", "description": "manage tmux coding-agent sessions"},
@@ -32,6 +33,7 @@ def build_help_text(commands: list[dict[str, str]] | None = None) -> str:
         "Talk to me in normal language: goals, bugs, architecture, or raw ideas.",
         "I will reason, run tools when needed, and answer directly.",
         "Use /commands to inspect command menu, built-in tools, plugins, and skills.",
+        "Use /new to start a fresh conversation in this chat.",
         "Use /memory to inspect status or run memory/mission sync.",
         "Use /tmux to list/create/send/log/kill tmux sessions for coding agents.",
     ]
@@ -282,6 +284,12 @@ def run_compact_command(bot: Any, raw_args: str) -> str:
             )
         )
     return "compact unavailable"
+
+
+def run_new_session_command(bot: Any) -> str:
+    if hasattr(bot, "start_new_session"):
+        return str(bot.start_new_session())
+    return "new session unavailable"
 
 
 def run_remember_command(bot: Any, raw_args: str) -> str:
