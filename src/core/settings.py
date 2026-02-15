@@ -9,14 +9,18 @@ DEFAULT_SKILLS_DIR = "src/skills"
 DEFAULT_MEMORY_DIR = "src/memory"
 DEFAULT_MEMORY_TZ = "Asia/Shanghai"
 DEFAULT_MEMORY_DAILY_SYNC_TIME = "02:00"
+DEFAULT_MEMORY_MICRO_SYNC_TIMES = "10:00,13:00,16:00,19:00,22:00"
+DEFAULT_MEMORY_WEEKLY_COMPOUND_TIME = "22:00"
+DEFAULT_MEMORY_WEEKLY_COMPOUND_WEEKDAY = 6
 DEFAULT_QMD_COMMAND = "qmd"
 DEFAULT_QMD_TIMEOUT_SEC = 30
 DEFAULT_MEMORY_TOP_K = 6
 DEFAULT_MEMORY_MAX_INJECT_CHARS = 4000
-DEFAULT_NOUS_PATH = "src/NOUS.md"
+DEFAULT_NOUS_PATH = "src/core/NOUS.md"
 DEFAULT_NOUS_TZ = "Asia/Shanghai"
 DEFAULT_AUTO_COMPACT_MAX_TOKENS = 12000
 DEFAULT_AUTO_COMPACT_KEEP_LAST_MESSAGES = 12
+DEFAULT_AUTO_BRAINDUMP_ENABLED = True
 
 
 def resolve_env_path(env_path: str | None = None) -> str:
@@ -40,6 +44,17 @@ def _read_int_env(name: str, default: int, *, allow_zero: bool = False) -> int:
     return value
 
 
+def _read_bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
 def load_runtime_settings(env_path: str | None = None) -> dict[str, str | int | None]:
     load_dotenv(resolve_env_path(env_path))
     return {
@@ -54,6 +69,18 @@ def load_runtime_settings(env_path: str | None = None) -> dict[str, str | int | 
         "memory_daily_sync_time": os.getenv(
             "ABRAXAS_MEMORY_DAILY_SYNC_TIME",
             DEFAULT_MEMORY_DAILY_SYNC_TIME,
+        ),
+        "memory_micro_sync_times": os.getenv(
+            "ABRAXAS_MEMORY_MICRO_SYNC_TIMES",
+            DEFAULT_MEMORY_MICRO_SYNC_TIMES,
+        ),
+        "memory_weekly_compound_time": os.getenv(
+            "ABRAXAS_MEMORY_WEEKLY_COMPOUND_TIME",
+            DEFAULT_MEMORY_WEEKLY_COMPOUND_TIME,
+        ),
+        "memory_weekly_compound_weekday": _read_int_env(
+            "ABRAXAS_MEMORY_WEEKLY_COMPOUND_WEEKDAY",
+            DEFAULT_MEMORY_WEEKLY_COMPOUND_WEEKDAY,
         ),
         "qmd_command": os.getenv("ABRAXAS_QMD_COMMAND", DEFAULT_QMD_COMMAND),
         "qmd_timeout_sec": _read_int_env("ABRAXAS_QMD_TIMEOUT_SEC", DEFAULT_QMD_TIMEOUT_SEC),
@@ -72,23 +99,10 @@ def load_runtime_settings(env_path: str | None = None) -> dict[str, str | int | 
             DEFAULT_AUTO_COMPACT_KEEP_LAST_MESSAGES,
         ),
         "auto_compact_instructions": os.getenv("ABRAXAS_AUTO_COMPACT_INSTRUCTIONS") or None,
+        "auto_braindump_enabled": _read_bool_env(
+            "ABRAXAS_AUTO_BRAINDUMP_ENABLED",
+            DEFAULT_AUTO_BRAINDUMP_ENABLED,
+        ),
         "nous_path": os.getenv("ABRAXAS_NOUS_PATH", DEFAULT_NOUS_PATH),
         "nous_tz": os.getenv("ABRAXAS_NOUS_TZ", DEFAULT_NOUS_TZ),
-    }
-
-
-def load_settings(env_path: str = ".env") -> dict[str, str | None]:
-    runtime = load_runtime_settings(env_path)
-    return {
-        "api_key": runtime["api_key"],
-        "base_url": str(runtime["base_url"]),
-        "model": str(runtime["model"]),
-    }
-
-
-def load_telegram_settings(env_path: str = ".env") -> dict[str, str | None]:
-    runtime = load_runtime_settings(env_path)
-    return {
-        "telegram_bot_token": runtime["telegram_bot_token"],
-        "allowed_telegram_chat_ids": runtime["allowed_telegram_chat_ids"],
     }

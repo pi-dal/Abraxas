@@ -9,9 +9,16 @@ Memory is a first-class runtime layer.
 
 Write policy:
 - Manual: `/remember <note>`
+- Manual ops: `/memory status|sync|promote|compound|query`
 - Automatic: pre-compaction flush
+- Automatic idea capture: keyword-triggered braindump capture in chat
 - Scheduled: daily sync (default `02:00`, `Asia/Shanghai`)
 
 QMD integration:
 - Recall: `qmd query "<question>"`
 - Index refresh after writes: `qmd update && qmd embed`
+
+Mission-Memory bridge:
+- `promote_braindump_to_mission`: promote raw dumps into mission log
+- `sync_mission_to_memory`: sync mission backlog into `MEMORY.md`
+- `compound_weekly_memory`: maintain one upserted weekly compound section

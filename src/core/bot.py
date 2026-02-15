@@ -61,6 +61,18 @@ def build_system_prompt(
 
 
 class CodingBot:
+    AUTO_BRAINDUMP_KEYWORDS = (
+        "想法",
+        "灵感",
+        "记一下",
+        "记住这个",
+        "待办",
+        "todo",
+        "idea",
+        "note to self",
+        "brain dump",
+    )
+
     def __init__(
         self,
         model: str | None = None,
@@ -89,6 +101,7 @@ class CodingBot:
         )
         instructions = config.get("auto_compact_instructions")
         self.auto_compact_instructions = str(instructions) if instructions else None
+        self.auto_braindump_enabled = bool(config.get("auto_braindump_enabled", True))
 
     def refresh_system_prompt(self) -> str:
         prompt = build_system_prompt()
@@ -292,7 +305,39 @@ class CodingBot:
             instructions=instructions,
         )
 
+    @staticmethod
+    def _should_auto_capture_braindump(user_text: str) -> bool:
+        text = user_text.strip()
+        if not text:
+            return False
+        if text.startswith("/"):
+            return False
+        lowered = text.lower()
+        for keyword in CodingBot.AUTO_BRAINDUMP_KEYWORDS:
+            if keyword in lowered or keyword in text:
+                return True
+        return False
+
+    def _auto_capture_braindump_if_needed(self, user_text: str) -> str | None:
+        if not getattr(self, "auto_braindump_enabled", True):
+            return None
+        runtime = getattr(self, "memory_runtime", None)
+        if runtime is None:
+            return None
+        if not self._should_auto_capture_braindump(user_text):
+            return None
+        try:
+            result = runtime.append_braindump(user_text, tags=["auto", "conversation"])
+            if hasattr(runtime, "record_mission_log"):
+                runtime.record_mission_log(f"auto memory capture: {user_text[:120]}")
+            if hasattr(runtime, "refresh_index"):
+                runtime.refresh_index()
+            return result
+        except Exception:
+            return None
+
     def ask(self, user_text: str, on_tool=None) -> str:
+        self._auto_capture_braindump_if_needed(user_text)
         self._auto_compact_if_needed(user_text)
         runtime = getattr(self, "memory_runtime", None)
         if runtime is not None:

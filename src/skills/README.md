@@ -10,5 +10,7 @@ Drop additional `.md` or `.txt` instruction files in this folder to extend Abrax
   - `skills-first.md`
   - `skill-creator.md`
   - `skill-installer.md`
+  - `plugin-creator.md`
+  - `nano-banana-pro-photo.md`
 
 Use `ABRAXAS_SKILLS_DIR` to point to a different skills folder at runtime.

@@ -15,3 +15,6 @@
 ## Scheduler Defaults
 - Daily memory sync timezone: `Asia/Shanghai`
 - Daily memory sync time: `02:00`
+- Daily flow: snapshot -> promote braindump -> sync mission to memory -> refresh index
+- Micro flow: lightweight snapshot + refresh index
+- Weekly flow: compound daily logs + sync mission to memory + refresh index

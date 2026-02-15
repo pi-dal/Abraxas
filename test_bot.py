@@ -1,8 +1,13 @@
+import importlib.util
 import os
 import pathlib
 import sys
 import tempfile
+import tomllib
 import unittest
+from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "src"))
 
@@ -16,20 +21,18 @@ from channel.cli import (
 import core.bot as core_bot
 import core.memory as core_memory
 import core.nous as core_nous
+import core.scheduler as core_scheduler
 import core.settings as core_settings
 from core.bot import SYSTEM_PROMPT
 from core.registry import build_tool_registry, create_reloadable_tool_registry
 from core import tools as core_tools
 from core.bot import build_system_prompt
 from core.skills import load_skills_prompt
-from core.settings import load_settings as core_load_settings
-from dotenv_config import (
+from core.settings import (
     DEFAULT_BASE_URL,
     DEFAULT_MODEL,
-    load_settings,
-    load_telegram_settings,
 )
-from tools import (
+from core.tools import (
     TOOLS,
     call_tool,
     run_bash,
@@ -38,7 +41,21 @@ from tools import (
 
 
 class BotTests(unittest.TestCase):
+    @staticmethod
+    def _load_nano_banana_plugin_module():
+        repo_root = pathlib.Path(__file__).resolve().parent
+        module_path = repo_root / "src" / "plugins" / "nano_banana_image.py"
+        spec = importlib.util.spec_from_file_location("nano_banana_image_test_module", module_path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError("failed to load nano_banana_image plugin module spec")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
     class _FakeToolRegistry:
+        def __init__(self):
+            self.calls: list[tuple[str, str]] = []
+
         def tool_specs(self):
             return [
                 {
@@ -49,7 +66,17 @@ class BotTests(unittest.TestCase):
                     "type": "function",
                     "function": {"name": "demo_plugin", "description": "[plugin] plugin tool"},
                 },
+                {
+                    "type": "function",
+                    "function": {"name": "tmux_manager", "description": "[plugin] tmux tool"},
+                },
             ]
+
+        def call(self, name: str, arguments: str):
+            self.calls.append((name, arguments))
+            if name == "tmux_manager":
+                return "tmux sessions: (none)"
+            return f"unknown tool: {name}"
 
     class _FakeCliBot:
         def __init__(self):
@@ -109,7 +136,55 @@ class BotTests(unittest.TestCase):
 
     def test_top_level_shims_point_to_core(self):
         self.assertIs(TOOLS, core_tools.TOOLS)
-        self.assertIs(load_settings, core_load_settings)
+
+    def test_src_entrypoint_shims_removed(self):
+        repo_root = pathlib.Path(__file__).resolve().parent
+        self.assertFalse((repo_root / "src" / "cli.py").exists())
+        self.assertFalse((repo_root / "src" / "telegram_bot.py").exists())
+
+    def test_root_entrypoint_wrappers_removed(self):
+        repo_root = pathlib.Path(__file__).resolve().parent
+        self.assertFalse((repo_root / "bot.py").exists())
+        self.assertFalse((repo_root / "telegram_bot.py").exists())
+
+    def test_project_scripts_configured(self):
+        repo_root = pathlib.Path(__file__).resolve().parent
+        data = tomllib.loads((repo_root / "pyproject.toml").read_text(encoding="utf-8"))
+        scripts = data.get("tool", {}).get("pdm", {}).get("scripts", {})
+        cli_script = scripts.get("abraxas-cli", {})
+        tg_script = scripts.get("abraxas-telegram", {})
+        self.assertIn("python -m channel.cli", cli_script.get("cmd", ""))
+        self.assertIn("python -m channel.telegram_runner", tg_script.get("cmd", ""))
+        self.assertEqual(cli_script.get("env", {}).get("PYTHONPATH"), "src")
+        self.assertEqual(tg_script.get("env", {}).get("PYTHONPATH"), "src")
+
+    def test_src_tools_shim_removed(self):
+        repo_root = pathlib.Path(__file__).resolve().parent
+        self.assertFalse((repo_root / "src" / "tools.py").exists())
+
+    def test_nous_file_moved_to_core(self):
+        repo_root = pathlib.Path(__file__).resolve().parent
+        self.assertEqual(core_settings.DEFAULT_NOUS_PATH, "src/core/NOUS.md")
+        self.assertTrue((repo_root / "src" / "core" / "NOUS.md").exists())
+        self.assertFalse((repo_root / "src" / "NOUS.md").exists())
+
+    def test_telegram_channel_is_split(self):
+        repo_root = pathlib.Path(__file__).resolve().parent
+        self.assertTrue((repo_root / "src" / "channel" / "telegram_client.py").exists())
+        self.assertTrue((repo_root / "src" / "channel" / "telegram_handlers.py").exists())
+        self.assertTrue((repo_root / "src" / "channel" / "telegram_runner.py").exists())
+
+    def test_core_commands_module_exists(self):
+        import core.commands as core_commands
+
+        self.assertTrue(hasattr(core_commands, "build_help_text"))
+        self.assertTrue(hasattr(core_commands, "build_commands_text"))
+        self.assertTrue(hasattr(core_commands, "run_memory_command"))
+        self.assertTrue(hasattr(core_commands, "run_tmux_plugin_command"))
+
+    def test_settings_use_single_runtime_loader(self):
+        self.assertFalse(hasattr(core_settings, "load_settings"))
+        self.assertFalse(hasattr(core_settings, "load_telegram_settings"))
 
     def test_load_skills_prompt_reads_markdown_files(self):
         with tempfile.TemporaryDirectory() as td:
@@ -209,6 +284,160 @@ class BotTests(unittest.TestCase):
                 content = file.read()
             self.assertIn("capture this idea", content)
             self.assertIn("[idea,product]", content)
+
+    def test_memory_runtime_query_uses_top_k_and_qmd_get(self):
+        with tempfile.TemporaryDirectory() as td:
+            runtime = core_memory.create_memory_runtime(
+                settings={
+                    "memory_dir": td,
+                    "qmd_command": "qmd",
+                    "memory_top_k": 2,
+                    "memory_max_inject_chars": 4000,
+                    "qmd_timeout_sec": 30,
+                    "memory_tz": "Asia/Shanghai",
+                }
+            )
+            calls: list[list[str]] = []
+
+            def fake_run(cmd, capture_output, text, timeout):
+                calls.append(cmd)
+                if cmd[1] == "query":
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=(
+                            "src/memory/MEMORY.md:12\n"
+                            "src/memory/daily/2026-02-15.md:8\n"
+                            "src/memory/braindump.md:3\n"
+                        ),
+                        stderr="",
+                    )
+                if cmd[1] == "get":
+                    target = cmd[2]
+                    return SimpleNamespace(returncode=0, stdout=f"snippet for {target}\n", stderr="")
+                return SimpleNamespace(returncode=1, stdout="", stderr="bad")
+
+            with patch("core.memory.subprocess.run", side_effect=fake_run):
+                out = runtime.query("what happened?")
+
+            self.assertIn("snippet for src/memory/MEMORY.md:12", out)
+            self.assertIn("snippet for src/memory/daily/2026-02-15.md:8", out)
+            self.assertNotIn("braindump.md:3", out)
+            query_calls = [cmd for cmd in calls if len(cmd) > 1 and cmd[1] == "query"]
+            self.assertTrue(query_calls)
+            self.assertIn("--top-k", query_calls[0])
+            get_calls = [cmd for cmd in calls if len(cmd) > 1 and cmd[1] == "get"]
+            self.assertEqual(len(get_calls), 2)
+
+    def test_memory_runtime_query_falls_back_to_raw_output_when_no_refs(self):
+        with tempfile.TemporaryDirectory() as td:
+            runtime = core_memory.create_memory_runtime(
+                settings={
+                    "memory_dir": td,
+                    "qmd_command": "qmd",
+                    "memory_top_k": 3,
+                    "memory_max_inject_chars": 4000,
+                    "qmd_timeout_sec": 30,
+                    "memory_tz": "Asia/Shanghai",
+                }
+            )
+
+            def fake_run(cmd, capture_output, text, timeout):
+                if cmd[1] == "query":
+                    return SimpleNamespace(returncode=0, stdout="plain output without refs", stderr="")
+                return SimpleNamespace(returncode=1, stdout="", stderr="bad")
+
+            with patch("core.memory.subprocess.run", side_effect=fake_run):
+                out = runtime.query("anything")
+            self.assertEqual(out, "plain output without refs")
+
+    def test_memory_runtime_weekly_compound_updates_memory_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            runtime = core_memory.create_memory_runtime(memory_dir=td)
+            daily_dir = os.path.join(td, "daily")
+            os.makedirs(daily_dir, exist_ok=True)
+            with open(os.path.join(daily_dir, "2026-02-10.md"), "w", encoding="utf-8") as file:
+                file.write("# 2026-02-10 Daily Log\n\n## Decisions\n- choose architecture A\n")
+            with open(os.path.join(daily_dir, "2026-02-11.md"), "w", encoding="utf-8") as file:
+                file.write("# 2026-02-11 Daily Log\n\n## Action Items\n- ship memory v2\n")
+
+            out = runtime.compound_weekly_memory()
+            self.assertIn("weekly compound", out)
+            with open(os.path.join(td, "MEMORY.md"), "r", encoding="utf-8") as file:
+                content = file.read()
+            self.assertIn("Weekly Compound", content)
+            self.assertIn("choose architecture A", content)
+
+    def test_memory_runtime_promotes_braindump_to_mission_log(self):
+        with tempfile.TemporaryDirectory() as td:
+            runtime = core_memory.create_memory_runtime(memory_dir=td)
+            runtime.append_braindump("idea alpha", tags=["idea"])
+            runtime.append_braindump("idea beta", tags=["todo"])
+
+            first = runtime.promote_braindump_to_mission(limit=10)
+            self.assertIn("mission sync saved", first)
+            with open(os.path.join(td, "mission-log.md"), "r", encoding="utf-8") as file:
+                content = file.read()
+            self.assertIn("[braindump:", content)
+            self.assertIn("idea alpha", content)
+            self.assertIn("idea beta", content)
+
+            second = runtime.promote_braindump_to_mission(limit=10)
+            self.assertIn("up-to-date", second)
+
+    def test_memory_runtime_promote_braindump_dedupes_same_body(self):
+        with tempfile.TemporaryDirectory() as td:
+            runtime = core_memory.create_memory_runtime(memory_dir=td)
+            braindump = os.path.join(td, "braindump.md")
+            with open(braindump, "w", encoding="utf-8") as file:
+                file.write("# Braindump\n\n")
+                file.write("- [2026-02-10 10:00 Asia/Shanghai] [idea] same idea\n")
+                file.write("- [2026-02-10 12:00 Asia/Shanghai] [todo] same idea\n")
+
+            out = runtime.promote_braindump_to_mission(limit=10)
+            self.assertIn("1 item(s)", out)
+
+    def test_memory_runtime_sync_mission_to_memory_upserts_section(self):
+        with tempfile.TemporaryDirectory() as td:
+            runtime = core_memory.create_memory_runtime(memory_dir=td)
+            runtime.record_mission_log("ship feature A")
+            first = runtime.sync_mission_to_memory(limit=20)
+            self.assertIn("saved", first)
+            second = runtime.sync_mission_to_memory(limit=20)
+            self.assertIn("up-to-date", second)
+            with open(os.path.join(td, "MEMORY.md"), "r", encoding="utf-8") as file:
+                content = file.read()
+            self.assertIn("Mission Memory", content)
+            self.assertIn("ship feature A", content)
+            self.assertEqual(content.count("Mission Memory"), 1)
+
+    def test_memory_runtime_doctor_report_shows_qmd_health(self):
+        with tempfile.TemporaryDirectory() as td:
+            runtime = core_memory.create_memory_runtime(memory_dir=td)
+            runtime._run_qmd = lambda command: (127, "", "qmd not found")
+            out = runtime.doctor_report()
+            self.assertIn("memory doctor:", out)
+            self.assertIn("qmd_available: no", out)
+            self.assertIn("suggestion:", out)
+
+    def test_memory_runtime_weekly_compound_upserts_section(self):
+        with tempfile.TemporaryDirectory() as td:
+            runtime = core_memory.create_memory_runtime(memory_dir=td)
+            daily_dir = os.path.join(td, "daily")
+            os.makedirs(daily_dir, exist_ok=True)
+            with open(os.path.join(daily_dir, "2026-02-10.md"), "w", encoding="utf-8") as file:
+                file.write("# 2026-02-10 Daily Log\n\n- first point\n")
+            out1 = runtime.compound_weekly_memory()
+            self.assertIn("saved", out1)
+
+            with open(os.path.join(daily_dir, "2026-02-11.md"), "w", encoding="utf-8") as file:
+                file.write("# 2026-02-11 Daily Log\n\n- second point\n")
+            out2 = runtime.compound_weekly_memory()
+            self.assertIn("saved", out2)
+
+            with open(os.path.join(td, "MEMORY.md"), "r", encoding="utf-8") as file:
+                content = file.read()
+            self.assertIn("Weekly Compound", content)
+            self.assertEqual(content.count("Weekly Compound"), 1)
 
     def test_coding_bot_remember_uses_memory_runtime(self):
         class _FakeMemory:
@@ -497,6 +726,9 @@ class BotTests(unittest.TestCase):
                 f.write("")
             sys.path.insert(0, td)
             try:
+                for module_name in list(sys.modules.keys()):
+                    if module_name == "plugins" or module_name.startswith("plugins."):
+                        sys.modules.pop(module_name, None)
                 registry = create_reloadable_tool_registry(plugin_package="plugins")
                 self.assertNotIn("hot_now", registry.plugin_names())
                 with open(os.path.join(plugins_dir, "hot_now.py"), "w", encoding="utf-8") as f:
@@ -587,6 +819,68 @@ class BotTests(unittest.TestCase):
         self.assertFalse(should_exit)
         self.assertIn("Telegram-only", out)
 
+    def test_cli_tmux_command_routes_to_handler(self):
+        bot = self._FakeCliBot()
+        handled, out, should_exit = handle_cli_command("/tmux list", bot)
+        self.assertTrue(handled)
+        self.assertFalse(should_exit)
+        self.assertTrue(bot.tool_registry.calls)
+        self.assertEqual(bot.tool_registry.calls[0][0], "tmux_manager")
+        self.assertIn("list", bot.tool_registry.calls[0][1])
+        self.assertIn("tmux sessions", out)
+
+    def test_cli_memory_status_command(self):
+        class _Memory:
+            def qmd_status(self):
+                return "ok"
+
+            def memory_status(self):
+                return "memory status: ok"
+
+        bot = self._FakeCliBot()
+        bot.memory_runtime = _Memory()
+        handled, out, should_exit = handle_cli_command("/memory status", bot)
+        self.assertTrue(handled)
+        self.assertFalse(should_exit)
+        self.assertIn("memory status", out)
+
+    def test_cli_memory_sync_command(self):
+        class _Memory:
+            def promote_braindump_to_mission(self):
+                return "mission sync saved: 1 item(s)"
+
+            def sync_mission_to_memory(self):
+                return "mission memory sync saved: 1 item(s)"
+
+            def refresh_index(self):
+                return "memory index refreshed"
+
+        bot = self._FakeCliBot()
+        bot.memory_runtime = _Memory()
+        bot.flush_memory_snapshot = lambda reason="manual", refresh_index=True: "memory saved to 2026-02-15.md"
+        handled, out, should_exit = handle_cli_command("/memory sync", bot)
+        self.assertTrue(handled)
+        self.assertFalse(should_exit)
+        self.assertIn("mission sync saved", out)
+        self.assertIn("mission memory sync saved", out)
+
+    def test_cli_memory_doctor_command(self):
+        class _Memory:
+            def doctor_report(self):
+                return "memory doctor:\n- qmd_available: yes"
+
+        bot = self._FakeCliBot()
+        bot.memory_runtime = _Memory()
+        handled, out, should_exit = handle_cli_command("/memory doctor", bot)
+        self.assertTrue(handled)
+        self.assertFalse(should_exit)
+        self.assertIn("memory doctor", out)
+
+    def test_auto_capture_braindump_keyword_detected(self):
+        self.assertTrue(core_bot.CodingBot._should_auto_capture_braindump("记一下这个想法，后面做"))
+        self.assertTrue(core_bot.CodingBot._should_auto_capture_braindump("note to self: build plugin"))
+        self.assertFalse(core_bot.CodingBot._should_auto_capture_braindump("今天上海天气不错"))
+
     def test_cli_nous_set_command(self):
         env_snapshot = os.environ.get("ABRAXAS_NOUS_PATH")
         try:
@@ -612,6 +906,68 @@ class BotTests(unittest.TestCase):
     def test_app_name_constant_removed(self):
         self.assertFalse(hasattr(cli, "APP_NAME"))
 
+    def test_plugin_creator_skill_exists(self):
+        skill_path = pathlib.Path(__file__).resolve().parent / "src" / "skills" / "plugin-creator.md"
+        self.assertTrue(skill_path.exists())
+        content = skill_path.read_text(encoding="utf-8")
+        self.assertIn("ToolPlugin", content)
+        self.assertIn("core.tools", content)
+
+    def test_nano_banana_photo_skill_exists(self):
+        skill_path = pathlib.Path(__file__).resolve().parent / "src" / "skills" / "nano-banana-pro-photo.md"
+        self.assertTrue(skill_path.exists())
+        content = skill_path.read_text(encoding="utf-8")
+        self.assertIn("gemini-3-pro-image-preview", content)
+        self.assertIn("gemini-2.5-flash-image", content)
+        self.assertIn("https://ai.google.dev/gemini-api/docs/image-generation", content)
+        self.assertIn("Generate images in batch", content)
+        self.assertIn("Inpainting (Semantic masking)", content)
+        self.assertIn("Advanced composition: Combining multiple images", content)
+
+    def test_nano_banana_plugin_registers(self):
+        registry, errors = build_tool_registry()
+        self.assertIn("nano_banana_image", registry.plugin_names())
+        self.assertFalse(any("nano_banana_image" in item for item in errors))
+
+    def test_nano_banana_plugin_missing_key_error(self):
+        nano_banana_image = self._load_nano_banana_plugin_module()
+
+        with patch.dict(os.environ, {"GOOGLE_API_KEY": "", "GEMINI_API_KEY": ""}, clear=False):
+            out = nano_banana_image._handle(
+                {
+                    "mode": "text_to_image",
+                    "prompt": "A red apple on wooden table",
+                    "api_key": "",
+                }
+            )
+        self.assertIn("missing GOOGLE_API_KEY or GEMINI_API_KEY", out)
+
+    def test_nano_banana_plugin_search_mode_adds_google_search_tool(self):
+        nano_banana_image = self._load_nano_banana_plugin_module()
+
+        body, err = nano_banana_image._build_single_request(
+            {"prompt": "today weather in shanghai"},
+            "search_grounded_generate",
+            "today weather in shanghai",
+        )
+        self.assertIsNone(err)
+        self.assertIn("tools", body)
+        self.assertEqual(body["tools"], [{"google_search": {}}])
+
+    def test_skill_installer_mentions_current_entrypoints(self):
+        skill_path = pathlib.Path(__file__).resolve().parent / "src" / "skills" / "skill-installer.md"
+        self.assertTrue(skill_path.exists())
+        content = skill_path.read_text(encoding="utf-8")
+        self.assertIn("npx skills find <query>", content)
+        self.assertIn("https://github.com/vercel-labs/skills --skill find-skills", content)
+        self.assertIn("npx skills add <owner/repo@skill>", content)
+        self.assertIn("npx skills check", content)
+        self.assertIn("npx skills update", content)
+        self.assertIn("update `src/skills/README.md`", content)
+        self.assertIn("pdm run abraxas-cli", content)
+        self.assertIn("pdm run abraxas-telegram", content)
+        self.assertIn("plugins are hot-reloaded", content.lower())
+
     def test_load_settings_uses_api_key_only(self):
         keys = [
             "API_KEY",
@@ -635,7 +991,7 @@ class BotTests(unittest.TestCase):
                         "OPENAI_BASE_URL=https://api.should.not.use\n"
                         "OPENAI_MODEL=should-not-use\n"
                     )
-                cfg = load_settings(path)
+                cfg = core_settings.load_runtime_settings(path)
                 self.assertEqual(cfg["api_key"], "generic-key")
                 self.assertEqual(cfg["base_url"], DEFAULT_BASE_URL)
                 self.assertEqual(cfg["model"], DEFAULT_MODEL)
@@ -705,6 +1061,33 @@ class BotTests(unittest.TestCase):
             self.assertEqual(runtime.qmd_timeout_sec, 77)
             self.assertEqual(runtime.tz_name, "Asia/Tokyo")
 
+    def test_multi_daily_scheduler_runs_due_slots_once(self):
+        scheduler = core_scheduler.MultiDailyScheduler(
+            times_text="10:00,13:00,16:00",
+            tz_name="Asia/Shanghai",
+        )
+        ran: list[str] = []
+        now = datetime(2026, 2, 16, 16, 30)
+        count = scheduler.run_if_due(lambda key: ran.append(key), now=now)
+        self.assertEqual(count, 3)
+        count_second = scheduler.run_if_due(lambda key: ran.append(key), now=now)
+        self.assertEqual(count_second, 0)
+
+    def test_weekly_scheduler_runs_only_on_target_weekday(self):
+        scheduler = core_scheduler.WeeklyScheduler(
+            time_text="22:00",
+            tz_name="Asia/Shanghai",
+            weekday=6,
+        )
+        ran = {"value": 0}
+        monday = datetime(2026, 2, 16, 22, 30)
+        sunday = datetime(2026, 2, 22, 22, 30)
+
+        self.assertFalse(scheduler.run_if_due(lambda: ran.__setitem__("value", 1), now=monday))
+        self.assertTrue(scheduler.run_if_due(lambda: ran.__setitem__("value", 2), now=sunday))
+        self.assertFalse(scheduler.run_if_due(lambda: ran.__setitem__("value", 3), now=sunday))
+        self.assertEqual(ran["value"], 2)
+
     def test_load_settings_ignores_legacy_keys(self):
         keys = ["API_KEY", "OPENAI_API_KEY", "GLM_API_KEY", "ZAI_API_KEY"]
         snapshot = {k: os.environ.get(k) for k in keys}
@@ -715,7 +1098,7 @@ class BotTests(unittest.TestCase):
                 path = os.path.join(td, ".env")
                 with open(path, "w", encoding="utf-8") as f:
                     f.write("GLM_API_KEY=glm-key\nOPENAI_API_KEY=openai-key\n")
-                cfg = load_settings(path)
+                cfg = core_settings.load_runtime_settings(path)
                 self.assertIsNone(cfg["api_key"])
                 self.assertEqual(cfg["base_url"], DEFAULT_BASE_URL)
                 self.assertEqual(cfg["model"], DEFAULT_MODEL)
@@ -739,7 +1122,7 @@ class BotTests(unittest.TestCase):
                         "TELEGRAM_BOT_TOKEN=test-token\n"
                         "ALLOWED_TELEGRAM_CHAT_IDS=1,2\n"
                     )
-                cfg = load_telegram_settings(path)
+                cfg = core_settings.load_runtime_settings(path)
                 self.assertEqual(cfg["telegram_bot_token"], "test-token")
                 self.assertEqual(cfg["allowed_telegram_chat_ids"], "1,2")
         finally:
@@ -759,7 +1142,7 @@ class BotTests(unittest.TestCase):
                 path = os.path.join(td, ".env")
                 with open(path, "w", encoding="utf-8") as f:
                     f.write("TELEGRAM_BOT_TOKEN=test-token\n")
-                cfg = load_telegram_settings(path)
+                cfg = core_settings.load_runtime_settings(path)
                 self.assertEqual(cfg["telegram_bot_token"], "test-token")
                 self.assertIsNone(cfg["allowed_telegram_chat_ids"])
         finally:

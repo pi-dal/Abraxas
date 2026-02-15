@@ -13,6 +13,8 @@ from channel.telegram import (
     parse_allowed_chat_ids,
     process_update,
     run_daily_memory_sync,
+    run_micro_memory_sync,
+    run_weekly_memory_compound,
     sync_telegram_commands,
 )
 
@@ -70,6 +72,9 @@ class _FakeBot:
 
 
 class _FakeRegistry:
+    def __init__(self):
+        self.calls = []
+
     def tool_specs(self):
         return [
             {
@@ -80,7 +85,17 @@ class _FakeRegistry:
                 "type": "function",
                 "function": {"name": "telegram_config", "description": "[plugin] Configure telegram."},
             },
+            {
+                "type": "function",
+                "function": {"name": "tmux_manager", "description": "[plugin] Manage tmux."},
+            },
         ]
+
+    def call(self, name, arguments):
+        self.calls.append((name, arguments))
+        if name == "tmux_manager":
+            return "tmux sessions: (none)"
+        return f"unknown tool: {name}"
 
 
 class TelegramBotTests(unittest.TestCase):
@@ -163,6 +178,8 @@ class TelegramBotTests(unittest.TestCase):
         self.assertIn("I am Abraxas", client.sent[0]["text"])
         self.assertIn("/commands", client.sent[0]["text"])
         self.assertIn("normal language", client.sent[0]["text"])
+        self.assertIn("/tmux", client.sent[0]["text"])
+        self.assertIn("/memory", client.sent[0]["text"])
 
     def test_process_update_commands_lists_inventory(self):
         env_snapshot = os.environ.get("ABRAXAS_SKILLS_DIR")
@@ -189,10 +206,12 @@ class TelegramBotTests(unittest.TestCase):
 
                 text = client.sent[-1]["text"]
                 self.assertIn("Capabilities", text)
+                self.assertIn("/tmux", text)
                 self.assertIn("builtin tools", text)
                 self.assertIn("bash", text)
                 self.assertIn("plugin tools", text)
                 self.assertIn("telegram_config", text)
+                self.assertIn("tmux_manager", text)
                 self.assertIn("skills", text)
                 self.assertIn("alpha.md", text)
                 self.assertIn("beta.txt", text)
@@ -251,6 +270,109 @@ class TelegramBotTests(unittest.TestCase):
         result = sync_telegram_commands(client)
         self.assertTrue(result)
         self.assertEqual(client.commands_synced[-1], DEFAULT_TELEGRAM_COMMANDS)
+
+    def test_default_commands_include_tmux(self):
+        names = [item["command"] for item in DEFAULT_TELEGRAM_COMMANDS]
+        self.assertIn("tmux", names)
+        self.assertIn("memory", names)
+
+    def test_process_update_tmux_command(self):
+        bot = _FakeBot()
+        sessions = {7: bot}
+        client = _FakeClient()
+        process_update(
+            {
+                "update_id": 88,
+                "message": {"message_id": 45, "chat": {"id": 7}, "text": "/tmux list"},
+            },
+            sessions,
+            client,
+            lambda: _FakeBot(),
+            {7},
+        )
+        self.assertTrue(bot.tool_registry.calls)
+        self.assertEqual(bot.tool_registry.calls[0][0], "tmux_manager")
+        self.assertIn("list", bot.tool_registry.calls[0][1])
+        self.assertIn("tmux sessions", client.sent[-1]["text"])
+
+    def test_process_update_memory_status(self):
+        class _Runtime:
+            def memory_status(self):
+                return "memory status: ok"
+
+            def qmd_status(self):
+                return "ok"
+
+        bot = _FakeBot()
+        bot.memory_runtime = _Runtime()
+        sessions = {7: bot}
+        client = _FakeClient()
+
+        process_update(
+            {
+                "update_id": 89,
+                "message": {"message_id": 46, "chat": {"id": 7}, "text": "/memory status"},
+            },
+            sessions,
+            client,
+            lambda: _FakeBot(),
+            {7},
+        )
+
+        self.assertIn("memory status", client.sent[-1]["text"])
+
+    def test_process_update_memory_sync(self):
+        class _Runtime:
+            def promote_braindump_to_mission(self):
+                return "mission sync saved: 1 item(s)"
+
+            def sync_mission_to_memory(self):
+                return "mission memory sync saved: 1 item(s)"
+
+            def refresh_index(self):
+                return "memory index refreshed"
+
+        bot = _FakeBot()
+        bot.memory_runtime = _Runtime()
+        sessions = {7: bot}
+        client = _FakeClient()
+
+        process_update(
+            {
+                "update_id": 90,
+                "message": {"message_id": 47, "chat": {"id": 7}, "text": "/memory sync"},
+            },
+            sessions,
+            client,
+            lambda: _FakeBot(),
+            {7},
+        )
+
+        self.assertIn("mission sync saved", client.sent[-1]["text"])
+        self.assertIn("mission memory sync saved", client.sent[-1]["text"])
+
+    def test_process_update_memory_doctor(self):
+        class _Runtime:
+            def doctor_report(self):
+                return "memory doctor:\n- qmd_available: yes"
+
+        bot = _FakeBot()
+        bot.memory_runtime = _Runtime()
+        sessions = {7: bot}
+        client = _FakeClient()
+
+        process_update(
+            {
+                "update_id": 91,
+                "message": {"message_id": 48, "chat": {"id": 7}, "text": "/memory doctor"},
+            },
+            sessions,
+            client,
+            lambda: _FakeBot(),
+            {7},
+        )
+
+        self.assertIn("memory doctor", client.sent[-1]["text"])
 
     def test_process_update_sync_commands(self):
         sessions = {}
@@ -386,11 +508,83 @@ class TelegramBotTests(unittest.TestCase):
                 os.environ["ABRAXAS_NOUS_PATH"] = snapshot
 
     def test_run_daily_memory_sync_flushes_all_sessions(self):
+        class _Runtime:
+            def __init__(self):
+                self.promoted = 0
+                self.synced = 0
+                self.refreshed = 0
+
+            def promote_braindump_to_mission(self):
+                self.promoted += 1
+                return "mission sync saved: 1 item(s)"
+
+            def sync_mission_to_memory(self):
+                self.synced += 1
+                return "mission memory sync saved: 1 item(s)"
+
+            def refresh_index(self):
+                self.refreshed += 1
+                return "memory index refreshed"
+
+        runtime = _Runtime()
+        bot1 = _FakeBot()
+        bot2 = _FakeBot()
+        bot1.memory_runtime = runtime
+        bot2.memory_runtime = runtime
+        sessions = {1: bot1, 2: bot2}
+
+        result = run_daily_memory_sync(sessions)
+        self.assertEqual(result["reason"], "daily-sync")
+        self.assertEqual(result["synced_sessions"], 2)
+        self.assertEqual(result["promoted_runtimes"], 1)
+        self.assertEqual(result["mission_memory_synced_runtimes"], 1)
+        self.assertEqual(runtime.promoted, 1)
+        self.assertEqual(runtime.synced, 1)
+        self.assertEqual(runtime.refreshed, 1)
+        self.assertEqual(sessions[1].daily_syncs, 1)
+        self.assertEqual(sessions[2].daily_syncs, 1)
+        self.assertIn("errors", result)
+
+    def test_run_daily_memory_sync_flushes_all_sessions_without_runtime(self):
         sessions = {1: _FakeBot(), 2: _FakeBot()}
         result = run_daily_memory_sync(sessions)
         self.assertEqual(result["synced_sessions"], 2)
         self.assertEqual(sessions[1].daily_syncs, 1)
         self.assertEqual(sessions[2].daily_syncs, 1)
+        self.assertIn("errors", result)
+
+    def test_run_micro_memory_sync_runs(self):
+        sessions = {1: _FakeBot(), 2: _FakeBot()}
+        result = run_micro_memory_sync(sessions)
+        self.assertEqual(result["reason"], "micro-sync")
+        self.assertEqual(result["synced_sessions"], 2)
+
+    def test_run_weekly_memory_compound_compounds_unique_runtimes(self):
+        class _Runtime:
+            def __init__(self):
+                self.compounded = 0
+                self.refreshed = 0
+
+            def compound_weekly_memory(self):
+                self.compounded += 1
+                return "ok"
+
+            def refresh_index(self):
+                self.refreshed += 1
+                return "memory index refreshed"
+
+        runtime = _Runtime()
+        bot1 = _FakeBot()
+        bot2 = _FakeBot()
+        bot1.memory_runtime = runtime
+        bot2.memory_runtime = runtime
+        sessions = {1: bot1, 2: bot2}
+
+        result = run_weekly_memory_compound(sessions)
+        self.assertEqual(result["reason"], "weekly-compound")
+        self.assertEqual(result["compounded_runtimes"], 1)
+        self.assertEqual(runtime.compounded, 1)
+        self.assertEqual(runtime.refreshed, 1)
 
     def test_process_update_blocks_non_whitelisted_chat(self):
         sessions = {}

@@ -7,16 +7,18 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.syntax import Syntax
 
-from channel.telegram import build_commands_text, build_help_text
-from core.bot import CodingBot
-from core.nous import (
-    append_nous_text,
-    load_nous_text,
-    reinforce_nous_from_dialogue,
-    write_nous_text,
+from core.commands import (
+    build_commands_text,
+    build_help_text,
+    run_compact_command,
+    run_memory_command,
+    run_nous_command,
+    run_remember_command,
+    run_tmux_plugin_command,
 )
+from core.bot import CodingBot
 from core.registry import create_reloadable_tool_registry
-from core.settings import load_settings
+from core.settings import load_runtime_settings
 
 PROMPT_TEXT = "you> "
 
@@ -105,91 +107,32 @@ def handle_cli_command(text: str, bot: CodingBot) -> tuple[bool, str, bool]:
     if command_text.startswith("/sync_commands"):
         return True, "sync_commands is Telegram-only.", False
 
-    if command_text.startswith("/compact"):
-        keep_last_messages = 12
-        instructions: str | None = None
-        raw_args = command_text[len("/compact") :].strip()
-        if raw_args:
-            parts = raw_args.split(maxsplit=1)
-            first = parts[0].strip()
-            if first.isdigit():
-                keep_last_messages = int(first)
-                if keep_last_messages <= 0:
-                    return True, "compact error: usage /compact [positive_integer] [instructions]", False
-                if len(parts) > 1:
-                    instructions = parts[1].strip() or None
-            else:
-                instructions = raw_args
+    if command_text.startswith("/tmux"):
+        raw_args = command_text[len("/tmux") :].strip()
+        return True, run_tmux_plugin_command(bot, raw_args), False
 
-        if hasattr(bot, "compact_session"):
-            out = bot.compact_session(
-                keep_last_messages=keep_last_messages,
-                instructions=instructions,
-            )
-            return True, out, False
-        return True, "compact unavailable", False
+    if command_text.startswith("/memory"):
+        raw_args = command_text[len("/memory") :].strip()
+        return True, run_memory_command(bot, raw_args), False
+
+    if command_text.startswith("/compact"):
+        raw_args = command_text[len("/compact") :].strip()
+        return True, run_compact_command(bot, raw_args), False
 
     if command_text.startswith("/remember"):
         raw = command_text[len("/remember") :].strip()
-        if not raw:
-            return True, "remember error: usage /remember <note>", False
-        tags = [part[1:] for part in raw.split() if part.startswith("#") and len(part) > 1]
-        if hasattr(bot, "remember"):
-            return True, bot.remember(raw, tags=tags), False
-        return True, "memory unavailable", False
+        return True, run_remember_command(bot, raw), False
 
     if command_text.startswith("/nous"):
         raw = command_text[len("/nous") :].strip()
-        if not raw or raw == "show":
-            text_out = load_nous_text()
-            return True, text_out or "NOUS is empty.", False
-
-        if raw.startswith("set "):
-            body = raw[len("set ") :].strip()
-            if not body:
-                return True, "nous error: usage /nous set <text>", False
-            try:
-                path = write_nous_text(body)
-            except Exception as exc:
-                return True, f"nous error: {exc}", False
-            refreshed = bot.refresh_system_prompt() if hasattr(bot, "refresh_system_prompt") else "skipped"
-            return True, f"NOUS updated at {path}. {refreshed}", False
-
-        if raw.startswith("append "):
-            body = raw[len("append ") :].strip()
-            if not body:
-                return True, "nous error: usage /nous append <text>", False
-            try:
-                path = append_nous_text(body)
-            except Exception as exc:
-                return True, f"nous error: {exc}", False
-            refreshed = bot.refresh_system_prompt() if hasattr(bot, "refresh_system_prompt") else "skipped"
-            return True, f"NOUS appended at {path}. {refreshed}", False
-
-        if raw.startswith("habit "):
-            body = raw[len("habit ") :].strip()
-            if not body:
-                return True, "nous error: usage /nous habit <text>", False
-            try:
-                path, section = reinforce_nous_from_dialogue(body, force_habit=True)
-            except Exception as exc:
-                return True, f"nous error: {exc}", False
-            refreshed = bot.refresh_system_prompt() if hasattr(bot, "refresh_system_prompt") else "skipped"
-            return True, f"NOUS reinforced in {section} at {path}. {refreshed}", False
-
-        try:
-            path, section = reinforce_nous_from_dialogue(raw)
-        except Exception as exc:
-            return True, f"nous error: {exc}", False
-        refreshed = bot.refresh_system_prompt() if hasattr(bot, "refresh_system_prompt") else "skipped"
-        return True, f"NOUS reinforced in {section} at {path}. {refreshed}", False
+        return True, run_nous_command(bot, raw), False
 
     return False, "", False
 
 
 def main() -> None:
     console = Console()
-    config = load_settings()
+    config = load_runtime_settings()
     if not config["api_key"]:
         console.print("[red]Missing API key (API_KEY)[/red]")
         return
