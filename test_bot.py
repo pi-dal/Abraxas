@@ -9,9 +9,13 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "src"))
 import channel.cli as cli
 from channel.cli import (
     PROMPT_TEXT,
+    handle_cli_command,
     make_input_session,
     make_reply_panel,
 )
+import core.bot as core_bot
+import core.memory as core_memory
+import core.nous as core_nous
 from core.bot import SYSTEM_PROMPT
 from core.registry import build_tool_registry, create_reloadable_tool_registry
 from core import tools as core_tools
@@ -33,10 +37,40 @@ from tools import (
 
 
 class BotTests(unittest.TestCase):
+    class _FakeToolRegistry:
+        def tool_specs(self):
+            return [
+                {
+                    "type": "function",
+                    "function": {"name": "bash", "description": "[builtin] bash tool"},
+                },
+                {
+                    "type": "function",
+                    "function": {"name": "demo_plugin", "description": "[plugin] plugin tool"},
+                },
+            ]
+
+    class _FakeCliBot:
+        def __init__(self):
+            self.tool_registry = BotTests._FakeToolRegistry()
+            self.remember_calls: list[tuple[str, list[str]]] = []
+
+        def compact_session(self, keep_last_messages=12, instructions=None):
+            return f"compacted:{keep_last_messages}:{instructions or ''}"
+
+        def remember(self, note, tags=None):
+            clean_tags = tags or []
+            self.remember_calls.append((note, clean_tags))
+            return "remembered"
+
+        def refresh_system_prompt(self):
+            return "system prompt refreshed"
+
     def test_system_prompt_protects_core_and_channel(self):
         self.assertIn("src/core", SYSTEM_PROMPT)
         self.assertIn("src/channel", SYSTEM_PROMPT)
         self.assertIn("src/skills", SYSTEM_PROMPT)
+        self.assertIn("src/memory", SYSTEM_PROMPT)
         self.assertIn("skills in src/skills first", SYSTEM_PROMPT)
         self.assertIn("plugin", SYSTEM_PROMPT.lower())
         self.assertIn("[builtin]", SYSTEM_PROMPT)
@@ -100,15 +134,177 @@ class BotTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             with open(os.path.join(td, "ops.md"), "w", encoding="utf-8") as f:
                 f.write("Do not break runtime.")
-            prompt = build_system_prompt(skills_dir=td)
+            prompt = build_system_prompt(skills_dir=td, nous_path=os.path.join(td, "NOUS.md"))
             self.assertIn("Do not break runtime.", prompt)
             self.assertIn("Additional skills loaded", prompt)
 
     def test_build_system_prompt_without_skills_uses_base_prompt(self):
         with tempfile.TemporaryDirectory() as td:
             missing = os.path.join(td, "skills-missing")
-            prompt = build_system_prompt(skills_dir=missing)
+            missing_nous = os.path.join(td, "NOUS-missing.md")
+            prompt = build_system_prompt(skills_dir=missing, nous_path=missing_nous)
             self.assertEqual(prompt, SYSTEM_PROMPT)
+
+    def test_build_system_prompt_includes_nous(self):
+        with tempfile.TemporaryDirectory() as td:
+            nous_path = os.path.join(td, "NOUS.md")
+            with open(nous_path, "w", encoding="utf-8") as f:
+                f.write("Name: Abraxas\nPrime Directive: Reveal structure beneath chaos.")
+            prompt = build_system_prompt(skills_dir=td, nous_path=nous_path)
+            self.assertIn("NOUS profile loaded", prompt)
+            self.assertIn("Prime Directive", prompt)
+
+    def test_nous_persist_roundtrip(self):
+        with tempfile.TemporaryDirectory() as td:
+            nous_path = os.path.join(td, "NOUS.md")
+            core_nous.write_nous_text("line one", nous_path=nous_path)
+            core_nous.append_nous_text("line two", nous_path=nous_path)
+            text = core_nous.load_nous_text(nous_path=nous_path)
+            self.assertIn("line one", text)
+            self.assertIn("line two", text)
+
+    def test_nous_reinforce_from_dialogue(self):
+        with tempfile.TemporaryDirectory() as td:
+            nous_path = os.path.join(td, "NOUS.md")
+            core_nous.write_nous_text("## Identity\nName: Abraxas", nous_path=nous_path)
+            _, section = core_nous.reinforce_nous_from_dialogue(
+                "When uncertain, run a quick experiment before theorizing.",
+                nous_path=nous_path,
+            )
+            text = core_nous.load_nous_text(nous_path=nous_path)
+            self.assertEqual(section, "NOUS Reinforcements")
+            self.assertIn("NOUS Reinforcements", text)
+            self.assertIn("run a quick experiment", text)
+
+    def test_nous_reinforce_habit_from_dialogue(self):
+        with tempfile.TemporaryDirectory() as td:
+            nous_path = os.path.join(td, "NOUS.md")
+            core_nous.write_nous_text("## Identity\nName: Abraxas", nous_path=nous_path)
+            _, section = core_nous.reinforce_nous_from_dialogue(
+                "用户习惯：偏好先看结论，再看证据。",
+                nous_path=nous_path,
+            )
+            text = core_nous.load_nous_text(nous_path=nous_path)
+            self.assertEqual(section, "User Habits (Persistent)")
+            self.assertIn("User Habits (Persistent)", text)
+            self.assertIn("偏好先看结论", text)
+
+    def test_memory_runtime_loads_brief(self):
+        with tempfile.TemporaryDirectory() as td:
+            with open(os.path.join(td, "MEMORY.md"), "w", encoding="utf-8") as f:
+                f.write("durable memory line")
+            runtime = core_memory.create_memory_runtime(memory_dir=td)
+            text = runtime.load_memory_brief()
+            self.assertIn("durable memory line", text)
+
+    def test_memory_runtime_appends_braindump(self):
+        with tempfile.TemporaryDirectory() as td:
+            runtime = core_memory.create_memory_runtime(memory_dir=td)
+            out = runtime.append_braindump("capture this idea", tags=["idea", "product"])
+            self.assertIn("saved", out)
+            path = os.path.join(td, "braindump.md")
+            self.assertTrue(os.path.exists(path))
+            with open(path, "r", encoding="utf-8") as file:
+                content = file.read()
+            self.assertIn("capture this idea", content)
+            self.assertIn("[idea,product]", content)
+
+    def test_coding_bot_remember_uses_memory_runtime(self):
+        class _FakeMemory:
+            def __init__(self):
+                self.calls = []
+
+            def append_braindump(self, note, tags=None):
+                self.calls.append((note, tags))
+                return "saved"
+
+        bot = core_bot.CodingBot.__new__(core_bot.CodingBot)
+        bot.memory_runtime = _FakeMemory()
+        out = core_bot.CodingBot.remember(bot, "new thought", tags=["task"])
+        self.assertEqual(out, "saved")
+        self.assertEqual(bot.memory_runtime.calls[0][0], "new thought")
+        self.assertEqual(bot.memory_runtime.calls[0][1], ["task"])
+
+    def test_coding_bot_compact_session_keeps_recent_messages(self):
+        bot = core_bot.CodingBot.__new__(core_bot.CodingBot)
+        bot.memory_runtime = None
+        bot.messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "u1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "u2"},
+            {"role": "assistant", "content": "a2"},
+            {"role": "user", "content": "u3"},
+        ]
+        result = core_bot.CodingBot.compact_session(
+            bot,
+            keep_last_messages=2,
+            instructions="Focus on decisions and open questions",
+        )
+        self.assertIn("session compacted", result)
+        self.assertEqual(bot.messages[0]["role"], "system")
+        self.assertEqual(bot.messages[1]["role"], "assistant")
+        self.assertIn("[compaction_summary]", bot.messages[1]["content"])
+        self.assertIn("Focus on decisions and open questions", bot.messages[1]["content"])
+        self.assertEqual(len(bot.messages), 4)
+        self.assertEqual(bot.messages[-1]["content"], "u3")
+
+    def test_auto_compact_if_needed_triggers_compaction(self):
+        bot = core_bot.CodingBot.__new__(core_bot.CodingBot)
+        bot.messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "A" * 500},
+            {"role": "assistant", "content": "B" * 500},
+            {"role": "user", "content": "C" * 500},
+        ]
+        bot.auto_compact_max_tokens = 10
+        bot.auto_compact_keep_last_messages = 2
+        bot.auto_compact_instructions = "Focus on constraints"
+
+        result = core_bot.CodingBot._auto_compact_if_needed(bot, "new input")
+        self.assertIn("session compacted", result)
+        self.assertEqual(bot.messages[0]["role"], "system")
+        self.assertIn("[compaction_summary]", bot.messages[1]["content"])
+        self.assertIn("Focus on constraints", bot.messages[1]["content"])
+
+    def test_auto_compact_if_needed_disabled(self):
+        bot = core_bot.CodingBot.__new__(core_bot.CodingBot)
+        bot.memory_runtime = None
+        bot.messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "u1"},
+            {"role": "assistant", "content": "a1"},
+        ]
+        bot.auto_compact_max_tokens = 0
+        bot.auto_compact_keep_last_messages = 2
+        bot.auto_compact_instructions = None
+
+        result = core_bot.CodingBot._auto_compact_if_needed(bot, "new input")
+        self.assertIsNone(result)
+        self.assertEqual(len(bot.messages), 3)
+
+    def test_compact_session_writes_memory_before_rewrite(self):
+        class _FakeMemory:
+            def __init__(self):
+                self.compactions = []
+
+            def record_compaction(self, summary):
+                self.compactions.append(summary)
+                return "ok"
+
+        bot = core_bot.CodingBot.__new__(core_bot.CodingBot)
+        bot.memory_runtime = _FakeMemory()
+        bot.messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "u1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "u2"},
+            {"role": "assistant", "content": "a2"},
+            {"role": "user", "content": "u3"},
+        ]
+        out = core_bot.CodingBot.compact_session(bot, keep_last_messages=2)
+        self.assertIn("session compacted", out)
+        self.assertTrue(bot.memory_runtime.compactions)
 
     def test_plugin_registry_extensible(self):
         registry = core_tools.create_default_registry()
@@ -348,6 +544,69 @@ class BotTests(unittest.TestCase):
     def test_make_input_session(self):
         session = make_input_session()
         self.assertTrue(hasattr(session, "prompt"))
+
+    def test_cli_help_command(self):
+        handled, out, should_exit = handle_cli_command("/help", self._FakeCliBot())
+        self.assertTrue(handled)
+        self.assertFalse(should_exit)
+        self.assertIn("I am Abraxas", out)
+        self.assertIn("/commands", out)
+
+    def test_cli_commands_command_lists_capabilities(self):
+        env_snapshot = os.environ.get("ABRAXAS_SKILLS_DIR")
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                with open(os.path.join(td, "alpha.md"), "w", encoding="utf-8") as file:
+                    file.write("skill alpha")
+                os.environ["ABRAXAS_SKILLS_DIR"] = td
+                handled, out, should_exit = handle_cli_command("/commands", self._FakeCliBot())
+                self.assertTrue(handled)
+                self.assertFalse(should_exit)
+                self.assertIn("Capabilities", out)
+                self.assertIn("builtin tools: bash", out)
+                self.assertIn("plugin tools: demo_plugin", out)
+                self.assertIn("skills: alpha.md", out)
+        finally:
+            if env_snapshot is None:
+                os.environ.pop("ABRAXAS_SKILLS_DIR", None)
+            else:
+                os.environ["ABRAXAS_SKILLS_DIR"] = env_snapshot
+
+    def test_cli_remember_command(self):
+        bot = self._FakeCliBot()
+        handled, out, should_exit = handle_cli_command("/remember test #alpha", bot)
+        self.assertTrue(handled)
+        self.assertFalse(should_exit)
+        self.assertEqual(out, "remembered")
+        self.assertEqual(bot.remember_calls[0], ("test #alpha", ["alpha"]))
+
+    def test_cli_sync_commands_is_telegram_only(self):
+        handled, out, should_exit = handle_cli_command("/sync_commands", self._FakeCliBot())
+        self.assertTrue(handled)
+        self.assertFalse(should_exit)
+        self.assertIn("Telegram-only", out)
+
+    def test_cli_nous_set_command(self):
+        env_snapshot = os.environ.get("ABRAXAS_NOUS_PATH")
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                nous_path = os.path.join(td, "NOUS.md")
+                os.environ["ABRAXAS_NOUS_PATH"] = nous_path
+                handled, out, should_exit = handle_cli_command(
+                    "/nous set Name: Abraxas",
+                    self._FakeCliBot(),
+                )
+                self.assertTrue(handled)
+                self.assertFalse(should_exit)
+                with open(nous_path, "r", encoding="utf-8") as file:
+                    content = file.read()
+                self.assertIn("Name: Abraxas", content)
+                self.assertIn("NOUS updated", out)
+        finally:
+            if env_snapshot is None:
+                os.environ.pop("ABRAXAS_NOUS_PATH", None)
+            else:
+                os.environ["ABRAXAS_NOUS_PATH"] = env_snapshot
 
     def test_app_name_constant_removed(self):
         self.assertFalse(hasattr(cli, "APP_NAME"))

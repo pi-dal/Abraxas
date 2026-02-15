@@ -1,20 +1,26 @@
+import os
 import pathlib
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "src"))
 
 from channel.telegram import (
+    DEFAULT_TELEGRAM_COMMANDS,
     chunk_message,
     extract_message_payload,
     parse_allowed_chat_ids,
     process_update,
+    run_daily_memory_sync,
+    sync_telegram_commands,
 )
 
 
 class _FakeClient:
     def __init__(self):
         self.sent = []
+        self.commands_synced = []
 
     def send_message(self, chat_id, text, reply_to_message_id=None):
         self.sent.append(
@@ -25,14 +31,56 @@ class _FakeClient:
             }
         )
 
+    def set_my_commands(self, commands):
+        self.commands_synced.append(commands)
+        return True
+
 
 class _FakeBot:
     def __init__(self):
         self.inputs = []
+        self.compacted = 0
+        self.compact_calls = []
+        self.remembered = []
+        self.daily_syncs = 0
+        self.memory_runtime = None
+        self.tool_registry = _FakeRegistry()
 
     def ask(self, text):
         self.inputs.append(text)
         return f"echo:{text}"
+
+    def compact_session(self, keep_last_messages=12, instructions=None):
+        self.compacted += 1
+        self.compact_calls.append(
+            {
+                "keep_last_messages": keep_last_messages,
+                "instructions": instructions,
+            }
+        )
+        return "session compacted: kept recent context"
+
+    def remember(self, note, tags=None):
+        self.remembered.append({"note": note, "tags": tags or []})
+        return "memory saved"
+
+    def flush_memory_snapshot(self, reason="daily-sync", refresh_index=False):
+        self.daily_syncs += 1
+        return f"memory snapshot flushed: {reason}"
+
+
+class _FakeRegistry:
+    def tool_specs(self):
+        return [
+            {
+                "type": "function",
+                "function": {"name": "bash", "description": "[builtin] Run shell command."},
+            },
+            {
+                "type": "function",
+                "function": {"name": "telegram_config", "description": "[plugin] Configure telegram."},
+            },
+        ]
 
 
 class TelegramBotTests(unittest.TestCase):
@@ -95,6 +143,254 @@ class TelegramBotTests(unittest.TestCase):
         self.assertEqual(client.sent[0]["text"], "echo:A")
         self.assertEqual(client.sent[1]["text"], "echo:B")
         self.assertEqual(client.sent[0]["reply_to_message_id"], 11)
+
+    def test_process_update_help_mentions_compact(self):
+        sessions = {}
+        client = _FakeClient()
+
+        process_update(
+            {
+                "update_id": 5,
+                "message": {"message_id": 22, "chat": {"id": 7}, "text": "/help"},
+            },
+            sessions,
+            client,
+            lambda: _FakeBot(),
+            {7},
+        )
+
+        self.assertTrue(client.sent)
+        self.assertIn("I am Abraxas", client.sent[0]["text"])
+        self.assertIn("/commands", client.sent[0]["text"])
+        self.assertIn("normal language", client.sent[0]["text"])
+
+    def test_process_update_commands_lists_inventory(self):
+        env_snapshot = os.environ.get("ABRAXAS_SKILLS_DIR")
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                with open(os.path.join(td, "alpha.md"), "w", encoding="utf-8") as f:
+                    f.write("skill alpha")
+                with open(os.path.join(td, "beta.txt"), "w", encoding="utf-8") as f:
+                    f.write("skill beta")
+                os.environ["ABRAXAS_SKILLS_DIR"] = td
+                sessions = {7: _FakeBot()}
+                client = _FakeClient()
+
+                process_update(
+                    {
+                        "update_id": 15,
+                        "message": {"message_id": 31, "chat": {"id": 7}, "text": "/commands"},
+                    },
+                    sessions,
+                    client,
+                    lambda: _FakeBot(),
+                    {7},
+                )
+
+                text = client.sent[-1]["text"]
+                self.assertIn("Capabilities", text)
+                self.assertIn("builtin tools", text)
+                self.assertIn("bash", text)
+                self.assertIn("plugin tools", text)
+                self.assertIn("telegram_config", text)
+                self.assertIn("skills", text)
+                self.assertIn("alpha.md", text)
+                self.assertIn("beta.txt", text)
+        finally:
+            if env_snapshot is None:
+                os.environ.pop("ABRAXAS_SKILLS_DIR", None)
+            else:
+                os.environ["ABRAXAS_SKILLS_DIR"] = env_snapshot
+
+    def test_process_update_compact_calls_bot_compact_session(self):
+        sessions = {7: _FakeBot()}
+        client = _FakeClient()
+
+        process_update(
+            {
+                "update_id": 6,
+                "message": {"message_id": 23, "chat": {"id": 7}, "text": "/compact"},
+            },
+            sessions,
+            client,
+            lambda: _FakeBot(),
+            {7},
+        )
+
+        self.assertEqual(sessions[7].compacted, 1)
+        self.assertEqual(sessions[7].compact_calls[0]["keep_last_messages"], 12)
+        self.assertIn("session compacted", client.sent[0]["text"])
+
+    def test_process_update_compact_with_instructions(self):
+        sessions = {7: _FakeBot()}
+        client = _FakeClient()
+
+        process_update(
+            {
+                "update_id": 7,
+                "message": {
+                    "message_id": 24,
+                    "chat": {"id": 7},
+                    "text": "/compact Focus on decisions only",
+                },
+            },
+            sessions,
+            client,
+            lambda: _FakeBot(),
+            {7},
+        )
+
+        self.assertEqual(sessions[7].compacted, 1)
+        self.assertEqual(
+            sessions[7].compact_calls[0]["instructions"],
+            "Focus on decisions only",
+        )
+
+    def test_sync_telegram_commands_uses_client_api(self):
+        client = _FakeClient()
+        result = sync_telegram_commands(client)
+        self.assertTrue(result)
+        self.assertEqual(client.commands_synced[-1], DEFAULT_TELEGRAM_COMMANDS)
+
+    def test_process_update_sync_commands(self):
+        sessions = {}
+        client = _FakeClient()
+
+        process_update(
+            {
+                "update_id": 8,
+                "message": {"message_id": 25, "chat": {"id": 7}, "text": "/sync_commands"},
+            },
+            sessions,
+            client,
+            lambda: _FakeBot(),
+            {7},
+        )
+
+        self.assertEqual(client.commands_synced[-1], DEFAULT_TELEGRAM_COMMANDS)
+        self.assertIn("command menu synced", client.sent[-1]["text"])
+
+    def test_process_update_remember(self):
+        bot = _FakeBot()
+        sessions = {7: bot}
+        client = _FakeClient()
+
+        process_update(
+            {
+                "update_id": 9,
+                "message": {"message_id": 26, "chat": {"id": 7}, "text": "/remember ship v2"},
+            },
+            sessions,
+            client,
+            lambda: _FakeBot(),
+            {7},
+        )
+
+        self.assertEqual(bot.remembered[0]["note"], "ship v2")
+        self.assertIn("memory saved", client.sent[-1]["text"])
+
+    def test_process_update_nous_show(self):
+        snapshot = os.environ.get("ABRAXAS_NOUS_PATH")
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                nous_path = os.path.join(td, "NOUS.md")
+                with open(nous_path, "w", encoding="utf-8") as f:
+                    f.write("Name: Abraxas\nMotto: Mirror + catalyst.")
+                os.environ["ABRAXAS_NOUS_PATH"] = nous_path
+                client = _FakeClient()
+
+                process_update(
+                    {
+                        "update_id": 10,
+                        "message": {"message_id": 27, "chat": {"id": 7}, "text": "/nous"},
+                    },
+                    {},
+                    client,
+                    lambda: _FakeBot(),
+                    {7},
+                )
+                self.assertIn("Motto: Mirror + catalyst.", client.sent[-1]["text"])
+        finally:
+            if snapshot is None:
+                os.environ.pop("ABRAXAS_NOUS_PATH", None)
+            else:
+                os.environ["ABRAXAS_NOUS_PATH"] = snapshot
+
+    def test_process_update_nous_set(self):
+        snapshot = os.environ.get("ABRAXAS_NOUS_PATH")
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                nous_path = os.path.join(td, "NOUS.md")
+                os.environ["ABRAXAS_NOUS_PATH"] = nous_path
+                client = _FakeClient()
+
+                process_update(
+                    {
+                        "update_id": 11,
+                        "message": {
+                            "message_id": 28,
+                            "chat": {"id": 7},
+                            "text": "/nous set Name: Abraxas",
+                        },
+                    },
+                    {},
+                    client,
+                    lambda: _FakeBot(),
+                    {7},
+                )
+
+                with open(nous_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                self.assertIn("Name: Abraxas", content)
+                self.assertIn("NOUS updated", client.sent[-1]["text"])
+        finally:
+            if snapshot is None:
+                os.environ.pop("ABRAXAS_NOUS_PATH", None)
+            else:
+                os.environ["ABRAXAS_NOUS_PATH"] = snapshot
+
+    def test_process_update_nous_conversational_reinforcement(self):
+        snapshot = os.environ.get("ABRAXAS_NOUS_PATH")
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                nous_path = os.path.join(td, "NOUS.md")
+                with open(nous_path, "w", encoding="utf-8") as f:
+                    f.write("## Identity\nName: Abraxas\n")
+                os.environ["ABRAXAS_NOUS_PATH"] = nous_path
+                client = _FakeClient()
+
+                process_update(
+                    {
+                        "update_id": 12,
+                        "message": {
+                            "message_id": 29,
+                            "chat": {"id": 7},
+                            "text": "/nous Speak more in compressed models.",
+                        },
+                    },
+                    {},
+                    client,
+                    lambda: _FakeBot(),
+                    {7},
+                )
+
+                with open(nous_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                self.assertIn("NOUS Reinforcements", content)
+                self.assertIn("compressed models", content)
+                self.assertIn("NOUS reinforced", client.sent[-1]["text"])
+        finally:
+            if snapshot is None:
+                os.environ.pop("ABRAXAS_NOUS_PATH", None)
+            else:
+                os.environ["ABRAXAS_NOUS_PATH"] = snapshot
+
+    def test_run_daily_memory_sync_flushes_all_sessions(self):
+        sessions = {1: _FakeBot(), 2: _FakeBot()}
+        result = run_daily_memory_sync(sessions)
+        self.assertEqual(result["synced_sessions"], 2)
+        self.assertEqual(sessions[1].daily_syncs, 1)
+        self.assertEqual(sessions[2].daily_syncs, 1)
 
     def test_process_update_blocks_non_whitelisted_chat(self):
         sessions = {}

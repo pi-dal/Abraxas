@@ -1,8 +1,11 @@
 import os
+from typing import Any
 
 from openai import OpenAI
 from typing import Protocol
 
+from .memory import create_memory_runtime
+from .nous import load_nous_prompt
 from .settings import load_settings
 from .skills import DEFAULT_SKILLS_DIR, load_skills_prompt
 from .tools import create_default_registry, tool_label
@@ -19,6 +22,7 @@ SYSTEM_PROMPT = (
     "You are Abraxas, a coding bot. Be concise. "
     "Treat src/core and src/channel as protected runtime code and do not edit them unless the user explicitly asks. "
     "Prefer applying skills in src/skills first. "
+    "Treat src/memory as a first-class memory layer, parallel to skills. "
     "If skills cannot solve the task, extend behavior via plugins in src/plugins. "
     "You may also follow optional skill instructions loaded from src/skills. "
     "Plugin contract: create a module in src/plugins that defines register(registry) and registers ToolPlugin from core.tools. "
@@ -30,13 +34,37 @@ SYSTEM_PROMPT = (
     "When task is done, return the final answer in plain text."
 )
 
+DEFAULT_AUTO_COMPACT_MAX_TOKENS = 12000
+DEFAULT_AUTO_COMPACT_KEEP_LAST_MESSAGES = 12
 
-def build_system_prompt(skills_dir: str | None = None) -> str:
+
+def _read_int_env(name: str, default: int, *, allow_zero: bool = False) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    if value < 0:
+        return default
+    if value == 0 and not allow_zero:
+        return default
+    return value
+
+
+def build_system_prompt(skills_dir: str | None = None, nous_path: str | None = None) -> str:
     resolved_skills_dir = skills_dir or os.getenv("ABRAXAS_SKILLS_DIR", DEFAULT_SKILLS_DIR)
+    nous_prompt = load_nous_prompt(nous_path)
     skills_prompt = load_skills_prompt(resolved_skills_dir)
-    if not skills_prompt:
+    if not nous_prompt and not skills_prompt:
         return SYSTEM_PROMPT
-    return f"{SYSTEM_PROMPT}\n\n{skills_prompt}"
+    sections = [SYSTEM_PROMPT]
+    if nous_prompt:
+        sections.append(nous_prompt)
+    if skills_prompt:
+        sections.append(skills_prompt)
+    return "\n\n".join(sections)
 
 
 class CodingBot:
@@ -50,8 +78,235 @@ class CodingBot:
         self.model = model or str(config["model"])
         self.tool_registry = tool_registry or create_default_registry()
         self.messages = [{"role": "system", "content": build_system_prompt()}]
+        self.memory_runtime = create_memory_runtime()
+        memory_brief = self.memory_runtime.load_memory_brief()
+        if memory_brief:
+            self.messages.append({"role": "system", "content": f"[memory_brief]\n{memory_brief}"})
+        self.auto_compact_max_tokens = _read_int_env(
+            "ABRAXAS_AUTO_COMPACT_MAX_TOKENS",
+            DEFAULT_AUTO_COMPACT_MAX_TOKENS,
+            allow_zero=True,
+        )
+        self.auto_compact_keep_last_messages = _read_int_env(
+            "ABRAXAS_AUTO_COMPACT_KEEP_LAST_MESSAGES",
+            DEFAULT_AUTO_COMPACT_KEEP_LAST_MESSAGES,
+        )
+        self.auto_compact_instructions = os.getenv("ABRAXAS_AUTO_COMPACT_INSTRUCTIONS") or None
+
+    def refresh_system_prompt(self) -> str:
+        prompt = build_system_prompt()
+        if not self.messages:
+            self.messages = [{"role": "system", "content": prompt}]
+            return "system prompt refreshed"
+        first = self.messages[0]
+        if first.get("role") == "system":
+            first["content"] = prompt
+            return "system prompt refreshed"
+        self.messages.insert(0, {"role": "system", "content": prompt})
+        return "system prompt refreshed"
+
+    @staticmethod
+    def _sanitize_recent_messages(messages: list[dict[str, Any]]) -> list[dict[str, str]]:
+        sanitized: list[dict[str, str]] = []
+        for message in messages:
+            role = str(message.get("role", ""))
+            if role == "tool":
+                continue
+            if role not in {"system", "user", "assistant"}:
+                continue
+
+            content = message.get("content", "")
+            if not isinstance(content, str):
+                content = str(content)
+            if role == "assistant" and message.get("tool_calls") and not content.strip():
+                continue
+            sanitized.append({"role": role, "content": content})
+        return sanitized
+
+    @staticmethod
+    def _stringify_message(message: dict[str, Any]) -> str:
+        role = str(message.get("role", "unknown"))
+        content = message.get("content", "")
+        if not isinstance(content, str):
+            content = str(content)
+        content = content.strip()
+        if not content:
+            content = "(no content)"
+        return f"{role}: {content}"
+
+    def _fallback_compaction_summary(
+        self,
+        older_messages: list[dict[str, Any]],
+        instructions: str | None = None,
+    ) -> str:
+        lines: list[str] = []
+        if instructions:
+            lines.append(f"compaction instructions: {instructions}")
+        lines.append("history summary:")
+        window = older_messages[-10:]
+        for message in window:
+            excerpt = self._stringify_message(message)
+            if len(excerpt) > 280:
+                excerpt = excerpt[:277] + "..."
+            lines.append(f"- {excerpt}")
+        if len(older_messages) > len(window):
+            lines.append(f"- ... ({len(older_messages) - len(window)} earlier message(s) omitted)")
+        return "\n".join(lines)
+
+    def _llm_compaction_summary(
+        self,
+        older_messages: list[dict[str, Any]],
+        instructions: str | None = None,
+    ) -> str:
+        fallback = self._fallback_compaction_summary(older_messages, instructions)
+        if not hasattr(self, "client") or not hasattr(self, "model"):
+            return fallback
+
+        transcript = "\n".join(self._stringify_message(message) for message in older_messages)
+        compact_instruction = instructions or (
+            "Focus on goals, decisions, constraints, open questions, and next steps."
+        )
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You compact coding conversations for long-running sessions. "
+                            "Output concise markdown with sections: Goals, Decisions, Constraints, "
+                            "Open Questions, Next Steps. Keep only durable information."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Compaction instructions: {compact_instruction}\n\n"
+                            f"Conversation transcript:\n{transcript}"
+                        ),
+                    },
+                ],
+                temperature=0.0,
+            )
+            content = response.choices[0].message.content or ""
+            summary = content.strip()
+            return summary or fallback
+        except Exception:
+            return fallback
+
+    def remember(self, note: str, tags: list[str] | None = None) -> str:
+        runtime = getattr(self, "memory_runtime", None)
+        if runtime is None:
+            return "memory unavailable"
+        try:
+            result = runtime.append_braindump(note, tags=tags or [])
+            if hasattr(runtime, "record_mission_log"):
+                runtime.record_mission_log(f"skill/memory note captured: {note[:120]}")
+            if hasattr(runtime, "refresh_index"):
+                runtime.refresh_index()
+            return result
+        except Exception as exc:
+            return f"memory error: {exc}"
+
+    def flush_memory_snapshot(self, reason: str = "manual", refresh_index: bool = True) -> str:
+        runtime = getattr(self, "memory_runtime", None)
+        if runtime is None:
+            return "memory unavailable"
+
+        conversation = self.messages[1:] if len(self.messages) > 1 else []
+        if not conversation:
+            return "memory snapshot skipped: empty session"
+
+        summary = self._llm_compaction_summary(
+            conversation,
+            instructions=f"Create durable memory summary for reason: {reason}",
+        )
+        result = runtime.record_daily_sync(summary)
+        if refresh_index:
+            runtime.refresh_index()
+        return result
+
+    def compact_session(
+        self,
+        keep_last_messages: int = 12,
+        instructions: str | None = None,
+    ) -> str:
+        if keep_last_messages <= 0:
+            keep_last_messages = 1
+        if len(self.messages) <= 1:
+            return "session compacted: no conversation messages."
+
+        conversation = self.messages[1:]
+        if len(conversation) <= keep_last_messages:
+            return "session compacted: nothing to compact."
+
+        keep_count = min(keep_last_messages, len(conversation))
+        older_messages = conversation[:-keep_count]
+        recent_messages = conversation[-keep_count:]
+        summary = self._llm_compaction_summary(older_messages, instructions)
+        runtime = getattr(self, "memory_runtime", None)
+        if runtime is not None:
+            try:
+                runtime.record_compaction(summary)
+                runtime.refresh_index()
+            except Exception:
+                pass
+
+        summary_message = {"role": "assistant", "content": f"[compaction_summary]\n{summary}"}
+        sanitized_recent = self._sanitize_recent_messages(recent_messages)
+
+        original_len = len(self.messages)
+        self.messages = [self.messages[0], summary_message] + sanitized_recent
+        removed = original_len - len(self.messages)
+        return (
+            f"session compacted: removed {removed} message(s), "
+            f"kept {len(self.messages) - 2} recent message(s) plus summary."
+        )
+
+    def _estimate_message_tokens(self, messages: list[dict[str, Any]]) -> int:
+        total_chars = 0
+        for message in messages:
+            content = message.get("content", "")
+            if not isinstance(content, str):
+                content = str(content)
+            total_chars += len(content) + 12
+        return max(1, total_chars // 4)
+
+    def _auto_compact_if_needed(self, next_user_text: str = "") -> str | None:
+        max_tokens = getattr(self, "auto_compact_max_tokens", DEFAULT_AUTO_COMPACT_MAX_TOKENS)
+        if max_tokens <= 0:
+            return None
+
+        estimated = self._estimate_message_tokens(self.messages)
+        if next_user_text:
+            estimated += max(1, len(next_user_text) // 4)
+
+        if estimated < max_tokens:
+            return None
+
+        keep_last_messages = getattr(
+            self,
+            "auto_compact_keep_last_messages",
+            DEFAULT_AUTO_COMPACT_KEEP_LAST_MESSAGES,
+        )
+        instructions = getattr(self, "auto_compact_instructions", None)
+        return self.compact_session(
+            keep_last_messages=keep_last_messages,
+            instructions=instructions,
+        )
 
     def ask(self, user_text: str, on_tool=None) -> str:
+        self._auto_compact_if_needed(user_text)
+        runtime = getattr(self, "memory_runtime", None)
+        if runtime is not None:
+            try:
+                memory_context = runtime.query(user_text)
+                if memory_context:
+                    self.messages.append(
+                        {"role": "system", "content": f"[memory_context]\n{memory_context}"}
+                    )
+            except Exception:
+                pass
         self.messages.append({"role": "user", "content": user_text})
         while True:
             response = self.client.chat.completions.create(

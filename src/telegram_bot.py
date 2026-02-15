@@ -1,6 +1,7 @@
 from channel.telegram import (
     TELEGRAM_API_BASE,
     TelegramClient,
+    run_daily_memory_sync,
     chunk_message,
     extract_message_payload,
     main,
@@ -16,7 +17,7 @@ __all__ = [
     "parse_allowed_chat_ids",
     "chunk_message",
     "process_update",
+    "run_daily_memory_sync",
     "run_telegram_bot",
     "main",
 ]
-
