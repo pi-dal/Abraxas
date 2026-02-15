@@ -15,6 +15,8 @@ from channel.cli import (
 from core.bot import SYSTEM_PROMPT
 from core.registry import build_tool_registry, create_reloadable_tool_registry
 from core import tools as core_tools
+from core.bot import build_system_prompt
+from core.skills import load_skills_prompt
 from core.settings import load_settings as core_load_settings
 from dotenv_config import (
     DEFAULT_BASE_URL,
@@ -34,14 +36,79 @@ class BotTests(unittest.TestCase):
     def test_system_prompt_protects_core_and_channel(self):
         self.assertIn("src/core", SYSTEM_PROMPT)
         self.assertIn("src/channel", SYSTEM_PROMPT)
+        self.assertIn("src/skills", SYSTEM_PROMPT)
+        self.assertIn("skills in src/skills first", SYSTEM_PROMPT)
         self.assertIn("plugin", SYSTEM_PROMPT.lower())
+        self.assertIn("[builtin]", SYSTEM_PROMPT)
+        self.assertIn("[plugin]", SYSTEM_PROMPT)
 
     def test_core_layer_exists(self):
         self.assertEqual(core_tools.TOOLS[0]["function"]["name"], "bash")
 
+    def test_default_tool_spec_has_builtin_tag(self):
+        registry = core_tools.create_default_registry()
+        specs = registry.tool_specs()
+        self.assertTrue(specs)
+        desc = specs[0]["function"]["description"]
+        self.assertTrue(desc.startswith("[builtin] "))
+
+    def test_plugin_tool_spec_has_plugin_tag(self):
+        registry = core_tools.create_default_registry()
+        registry.register(
+            core_tools.ToolPlugin(
+                name="echo_tagged",
+                description="Echo input text.",
+                parameters={
+                    "type": "object",
+                    "properties": {"text": {"type": "string"}},
+                    "required": ["text"],
+                },
+                handler=lambda payload: str(payload.get("text", "")),
+            )
+        )
+        specs = registry.tool_specs()
+        echo_spec = next(
+            spec for spec in specs if spec["function"]["name"] == "echo_tagged"
+        )
+        self.assertTrue(echo_spec["function"]["description"].startswith("[plugin] "))
+
     def test_top_level_shims_point_to_core(self):
         self.assertIs(TOOLS, core_tools.TOOLS)
         self.assertIs(load_settings, core_load_settings)
+
+    def test_load_skills_prompt_reads_markdown_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            with open(os.path.join(td, "alpha.md"), "w", encoding="utf-8") as f:
+                f.write("Always answer briefly.")
+            with open(os.path.join(td, "beta.txt"), "w", encoding="utf-8") as f:
+                f.write("Prefer plugins for extension.")
+
+            prompt = load_skills_prompt(td)
+            self.assertIn("Additional skills loaded", prompt)
+            self.assertIn("alpha.md", prompt)
+            self.assertIn("beta.txt", prompt)
+            self.assertIn("Always answer briefly.", prompt)
+            self.assertIn("Prefer plugins for extension.", prompt)
+
+    def test_load_skills_prompt_missing_directory(self):
+        with tempfile.TemporaryDirectory() as td:
+            missing = os.path.join(td, "skills-missing")
+            prompt = load_skills_prompt(missing)
+            self.assertEqual(prompt, "")
+
+    def test_build_system_prompt_includes_skills(self):
+        with tempfile.TemporaryDirectory() as td:
+            with open(os.path.join(td, "ops.md"), "w", encoding="utf-8") as f:
+                f.write("Do not break runtime.")
+            prompt = build_system_prompt(skills_dir=td)
+            self.assertIn("Do not break runtime.", prompt)
+            self.assertIn("Additional skills loaded", prompt)
+
+    def test_build_system_prompt_without_skills_uses_base_prompt(self):
+        with tempfile.TemporaryDirectory() as td:
+            missing = os.path.join(td, "skills-missing")
+            prompt = build_system_prompt(skills_dir=missing)
+            self.assertEqual(prompt, SYSTEM_PROMPT)
 
     def test_plugin_registry_extensible(self):
         registry = core_tools.create_default_registry()
@@ -219,6 +286,35 @@ class BotTests(unittest.TestCase):
                 registry.reload(force=True)
                 self.assertIn("flaky", registry.plugin_names())
                 self.assertEqual(registry.call("flaky", "{}"), "ok")
+            finally:
+                sys.path.remove(td)
+                for module_name in list(sys.modules.keys()):
+                    if module_name == "plugins" or module_name.startswith("plugins."):
+                        sys.modules.pop(module_name, None)
+
+    def test_reloadable_registry_default_is_immediate(self):
+        with tempfile.TemporaryDirectory() as td:
+            plugins_dir = os.path.join(td, "plugins")
+            os.makedirs(plugins_dir, exist_ok=True)
+            with open(os.path.join(plugins_dir, "__init__.py"), "w", encoding="utf-8") as f:
+                f.write("")
+            sys.path.insert(0, td)
+            try:
+                registry = create_reloadable_tool_registry(plugin_package="plugins")
+                self.assertNotIn("hot_now", registry.plugin_names())
+                with open(os.path.join(plugins_dir, "hot_now.py"), "w", encoding="utf-8") as f:
+                    f.write(
+                        "from core.tools import ToolPlugin\n\n"
+                        "def register(registry):\n"
+                        "    registry.register(ToolPlugin(\n"
+                        "        name='hot_now',\n"
+                        "        description='hot',\n"
+                        "        parameters={'type':'object','properties':{},'required':[]},\n"
+                        "        handler=lambda payload: 'ok',\n"
+                        "    ))\n"
+                    )
+                self.assertIn("hot_now", registry.plugin_names())
+                self.assertEqual(registry.call("hot_now", "{}"), "ok")
             finally:
                 sys.path.remove(td)
                 for module_name in list(sys.modules.keys()):

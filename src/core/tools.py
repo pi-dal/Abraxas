@@ -3,6 +3,9 @@ import subprocess
 from dataclasses import dataclass
 from typing import Any, Callable
 
+TOOL_TAG_BUILTIN = "builtin"
+TOOL_TAG_PLUGIN = "plugin"
+
 
 def run_bash(command: str, timeout: int = 20) -> str:
     try:
@@ -31,13 +34,20 @@ class ToolPlugin:
     description: str
     parameters: dict[str, Any]
     handler: Callable[[dict[str, Any]], str]
+    tag: str = TOOL_TAG_PLUGIN
+
+    def tagged_description(self) -> str:
+        prefix = f"[{self.tag}] "
+        if self.description.startswith(prefix):
+            return self.description
+        return f"{prefix}{self.description}"
 
     def to_spec(self) -> dict[str, Any]:
         return {
             "type": "function",
             "function": {
                 "name": self.name,
-                "description": self.description,
+                "description": self.tagged_description(),
                 "parameters": self.parameters,
             },
         }
@@ -86,6 +96,7 @@ def make_bash_plugin() -> ToolPlugin:
             "required": ["command"],
         },
         handler=lambda payload: run_bash(str(payload.get("command", ""))),
+        tag=TOOL_TAG_BUILTIN,
     )
 
 
@@ -109,4 +120,3 @@ def tool_label(name: str, arguments: str) -> str:
         command = str(payload.get("command", "")).strip()
         return f"{name}: {command}" if command else name
     return name
-

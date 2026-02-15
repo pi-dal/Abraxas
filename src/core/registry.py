@@ -63,7 +63,7 @@ class ReloadableToolRegistry:
         *,
         plugin_package: str = "plugins",
         extra_plugins: list[ToolPlugin] | None = None,
-        reload_interval: float = 0.5,
+        reload_interval: float = 0.0,
     ):
         self.plugin_package = plugin_package
         self.extra_plugins = list(extra_plugins or [])
@@ -107,7 +107,7 @@ def create_reloadable_tool_registry(
     *,
     plugin_package: str = "plugins",
     extra_plugins: list[ToolPlugin] | None = None,
-    reload_interval: float = 0.5,
+    reload_interval: float = 0.0,
 ) -> ReloadableToolRegistry:
     return ReloadableToolRegistry(
         plugin_package=plugin_package,

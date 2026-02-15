@@ -1,7 +1,10 @@
+import os
+
 from openai import OpenAI
 from typing import Protocol
 
 from .settings import load_settings
+from .skills import DEFAULT_SKILLS_DIR, load_skills_prompt
 from .tools import create_default_registry, tool_label
 
 
@@ -15,13 +18,25 @@ class ToolRuntime(Protocol):
 SYSTEM_PROMPT = (
     "You are Abraxas, a coding bot. Be concise. "
     "Treat src/core and src/channel as protected runtime code and do not edit them unless the user explicitly asks. "
-    "Prefer extending behavior via plugins in src/plugins. "
+    "Prefer applying skills in src/skills first. "
+    "If skills cannot solve the task, extend behavior via plugins in src/plugins. "
+    "You may also follow optional skill instructions loaded from src/skills. "
     "Plugin contract: create a module in src/plugins that defines register(registry) and registers ToolPlugin from core.tools. "
     "Plugins must fail safely and return readable error text instead of crashing runtime. "
+    "Distinguish tool source by tag: descriptions starting with [builtin] are built-in runtime tools; descriptions starting with [plugin] are external plugin tools. "
+    "When reasoning about capabilities, treat [builtin] and [plugin] as separate groups. "
     "Telegram configuration can be extended through plugin tools that manage TELEGRAM_BOT_TOKEN and ALLOWED_TELEGRAM_CHAT_IDS in .env. "
     "Use the bash tool when shell execution is needed. "
     "When task is done, return the final answer in plain text."
 )
+
+
+def build_system_prompt(skills_dir: str | None = None) -> str:
+    resolved_skills_dir = skills_dir or os.getenv("ABRAXAS_SKILLS_DIR", DEFAULT_SKILLS_DIR)
+    skills_prompt = load_skills_prompt(resolved_skills_dir)
+    if not skills_prompt:
+        return SYSTEM_PROMPT
+    return f"{SYSTEM_PROMPT}\n\n{skills_prompt}"
 
 
 class CodingBot:
@@ -34,7 +49,7 @@ class CodingBot:
         self.client = OpenAI(api_key=config["api_key"], base_url=config["base_url"])
         self.model = model or str(config["model"])
         self.tool_registry = tool_registry or create_default_registry()
-        self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        self.messages = [{"role": "system", "content": build_system_prompt()}]
 
     def ask(self, user_text: str, on_tool=None) -> str:
         self.messages.append({"role": "user", "content": user_text})
