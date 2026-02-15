@@ -303,6 +303,88 @@ class CodingBot:
         return max(1, total_chars // 4)
 
     @staticmethod
+    def _normalize_tool_call(tool_call: Any) -> dict[str, Any]:
+        fn = getattr(tool_call, "function", None)
+        name = str(getattr(fn, "name", "")).strip()
+        raw_arguments = getattr(fn, "arguments", "")
+        if isinstance(raw_arguments, str):
+            arguments = raw_arguments
+        else:
+            try:
+                arguments = json.dumps(raw_arguments, ensure_ascii=True)
+            except Exception:
+                arguments = "{}"
+        return {
+            "id": str(getattr(tool_call, "id", "")).strip(),
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": arguments,
+            },
+        }
+
+    @staticmethod
+    def _prepare_messages_for_api(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        prepared: list[dict[str, Any]] = []
+        for message in messages:
+            role = str(message.get("role", "")).strip()
+            if role not in {"system", "user", "assistant", "tool"}:
+                continue
+
+            entry: dict[str, Any] = {"role": role}
+            content = message.get("content", "")
+            if not isinstance(content, str):
+                content = str(content)
+
+            if role == "assistant":
+                tool_calls = message.get("tool_calls")
+                if isinstance(tool_calls, list) and tool_calls:
+                    normalized_calls: list[dict[str, Any]] = []
+                    for call in tool_calls:
+                        if not isinstance(call, dict):
+                            continue
+                        fn = call.get("function")
+                        if not isinstance(fn, dict):
+                            continue
+                        call_id = str(call.get("id", "")).strip()
+                        fn_name = str(fn.get("name", "")).strip()
+                        fn_args = fn.get("arguments", "")
+                        if not isinstance(fn_args, str):
+                            try:
+                                fn_args = json.dumps(fn_args, ensure_ascii=True)
+                            except Exception:
+                                fn_args = "{}"
+                        if not call_id or not fn_name:
+                            continue
+                        normalized_calls.append(
+                            {
+                                "id": call_id,
+                                "type": "function",
+                                "function": {"name": fn_name, "arguments": fn_args},
+                            }
+                        )
+                    if normalized_calls:
+                        entry["tool_calls"] = normalized_calls
+                        entry["content"] = content if content.strip() else None
+                    else:
+                        entry["content"] = content
+                else:
+                    entry["content"] = content
+            elif role == "tool":
+                entry["content"] = content
+                tool_call_id = str(message.get("tool_call_id", "")).strip()
+                if tool_call_id:
+                    entry["tool_call_id"] = tool_call_id
+                tool_name = str(message.get("name", "")).strip()
+                if tool_name:
+                    entry["name"] = tool_name
+            else:
+                entry["content"] = content
+
+            prepared.append(entry)
+        return prepared
+
+    @staticmethod
     def _is_context_overflow_error(exc: Exception) -> bool:
         text = str(exc).lower()
         markers = (
@@ -413,7 +495,7 @@ class CodingBot:
             try:
                 response = self.client.chat.completions.create(
                     model=self.model,
-                    messages=self.messages,
+                    messages=self._prepare_messages_for_api(self.messages),
                     tools=self.tool_registry.tool_specs(),
                     tool_choice="auto",
                     temperature=0.2,
@@ -426,30 +508,38 @@ class CodingBot:
                 raise
             message = response.choices[0].message
             tool_calls = message.tool_calls or []
-            entry = {"role": "assistant", "content": message.content or ""}
+            content = message.content
+            if content is None:
+                content = ""
+            entry = {"role": "assistant", "content": content}
             if tool_calls:
-                entry["tool_calls"] = [tool_call.model_dump() for tool_call in tool_calls]
+                entry["tool_calls"] = [self._normalize_tool_call(tool_call) for tool_call in tool_calls]
             self.messages.append(entry)
             if not tool_calls:
                 return message.content or ""
             for tool_call in tool_calls:
+                function_obj = getattr(tool_call, "function", None)
+                tool_name = str(getattr(function_obj, "name", "")).strip()
+                tool_arguments = getattr(function_obj, "arguments", "")
                 if on_tool:
-                    on_tool(tool_label(tool_call.function.name, tool_call.function.arguments))
+                    on_tool(tool_label(tool_name, tool_arguments))
                 tool_output = str(
                     self.tool_registry.call(
-                        tool_call.function.name, tool_call.function.arguments
+                        tool_name,
+                        tool_arguments,
                     )
                 )
                 if on_tool_result:
                     on_tool_result(
-                        tool_call.function.name,
-                        tool_call.function.arguments,
+                        tool_name,
+                        tool_arguments,
                         tool_output,
                     )
                 self.messages.append(
                     {
                         "role": "tool",
-                        "tool_call_id": tool_call.id,
+                        "tool_call_id": str(getattr(tool_call, "id", "")),
+                        "name": tool_name,
                         "content": tool_output,
                     }
                 )

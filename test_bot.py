@@ -541,6 +541,40 @@ class BotTests(unittest.TestCase):
         estimated = core_bot.CodingBot._estimate_message_tokens(bot, messages)
         self.assertGreater(estimated, 1000)
 
+    def test_prepare_messages_for_api_normalizes_assistant_tool_calls(self):
+        messages = [
+            {"role": "system", "content": "sys"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "nano_banana_image",
+                            "arguments": {"mode": "text_to_image", "prompt": "cat"},
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "name": "nano_banana_image",
+                "content": "image_saved: /tmp/a.png",
+            },
+        ]
+
+        out = core_bot.CodingBot._prepare_messages_for_api(messages)
+        self.assertEqual(out[1]["role"], "assistant")
+        self.assertIsNone(out[1]["content"])
+        self.assertEqual(out[1]["tool_calls"][0]["function"]["name"], "nano_banana_image")
+        self.assertIsInstance(out[1]["tool_calls"][0]["function"]["arguments"], str)
+        self.assertEqual(out[2]["role"], "tool")
+        self.assertEqual(out[2]["name"], "nano_banana_image")
+        self.assertEqual(out[2]["tool_call_id"], "call_1")
+
     def test_ask_retries_once_on_context_overflow(self):
         class _FakeToolRegistry:
             def tool_specs(self):
@@ -602,6 +636,61 @@ class BotTests(unittest.TestCase):
         self.assertEqual(out, "ok")
         self.assertEqual(compactions["count"], 1)
         self.assertEqual(completions.calls, 2)
+
+    def test_ask_appends_tool_message_with_name(self):
+        class _FakeToolRegistry:
+            def __init__(self):
+                self.calls = []
+
+            def tool_specs(self):
+                return []
+
+            def call(self, name, arguments):
+                self.calls.append((name, arguments))
+                return "ok"
+
+        class _ToolCall:
+            def __init__(self):
+                self.id = "call_1"
+                self.function = SimpleNamespace(name="bash", arguments='{"command":"echo hi"}')
+
+        class _Message:
+            def __init__(self, content: str, tool_calls):
+                self.content = content
+                self.tool_calls = tool_calls
+
+        class _Response:
+            def __init__(self, content: str, tool_calls):
+                self.choices = [SimpleNamespace(message=_Message(content, tool_calls))]
+
+        class _Completions:
+            def __init__(self):
+                self.calls = 0
+
+            def create(self, **kwargs):
+                _ = kwargs
+                self.calls += 1
+                if self.calls == 1:
+                    return _Response("", [_ToolCall()])
+                return _Response("done", [])
+
+        registry = _FakeToolRegistry()
+        bot = core_bot.CodingBot.__new__(core_bot.CodingBot)
+        bot.client = SimpleNamespace(chat=SimpleNamespace(completions=_Completions()))
+        bot.model = "glm-4.7"
+        bot.tool_registry = registry
+        bot.memory_runtime = None
+        bot.auto_braindump_enabled = False
+        bot.auto_compact_max_tokens = 0
+        bot.auto_compact_keep_last_messages = 2
+        bot.auto_compact_instructions = None
+        bot.messages = [{"role": "system", "content": "sys"}]
+
+        out = core_bot.CodingBot.ask(bot, "run")
+        self.assertEqual(out, "done")
+        tool_entries = [item for item in bot.messages if item.get("role") == "tool"]
+        self.assertTrue(tool_entries)
+        self.assertEqual(tool_entries[-1].get("name"), "bash")
 
     def test_compact_session_writes_memory_before_rewrite(self):
         class _FakeMemory:
