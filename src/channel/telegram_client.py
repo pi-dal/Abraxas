@@ -97,6 +97,24 @@ class TelegramClient:
             return result
         return []
 
+    def get_file(self, file_id: str) -> dict:
+        payload = {"file_id": str(file_id)}
+        result = self._post("getFile", payload)
+        return result if isinstance(result, dict) else {}
+
+    def download_file(self, file_path: str) -> bytes:
+        path_text = str(file_path).strip()
+        if not path_text:
+            raise RuntimeError("telegram file path is empty")
+        token = self.base_url.rsplit("/bot", 1)[-1]
+        url = f"{TELEGRAM_API_BASE}/file/bot{token}/{path_text}"
+        req = urllib.request.Request(url, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=self.request_timeout) as response:
+                return response.read()
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"telegram file download failed: {exc}") from exc
+
     def send_message(
         self, chat_id: int, text: str, reply_to_message_id: int | None = None
     ) -> dict:

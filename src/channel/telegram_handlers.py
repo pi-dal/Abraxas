@@ -1,3 +1,5 @@
+import base64
+import json
 from pathlib import Path
 from typing import Any
 
@@ -21,13 +23,16 @@ def extract_message_payload(update: dict) -> tuple[int, int, str] | None:
     if not isinstance(message, dict):
         return None
     chat = message.get("chat")
-    text = message.get("text")
+    text_value = message.get("text")
+    if not isinstance(text_value, str):
+        text_value = message.get("caption")
     chat_id = chat.get("id") if isinstance(chat, dict) else None
     message_id = message.get("message_id")
-    if not isinstance(chat_id, int) or not isinstance(message_id, int) or not isinstance(text, str):
+    if not isinstance(chat_id, int) or not isinstance(message_id, int):
         return None
-    text = text.strip()
-    if not text:
+    has_photo = bool(extract_largest_photo_file_id(message))
+    text = text_value.strip() if isinstance(text_value, str) else ""
+    if not text and not has_photo:
         return None
     return chat_id, message_id, text
 
@@ -66,6 +71,29 @@ def chunk_message(text: str, limit: int = 4096) -> list[str]:
     return chunks
 
 
+def extract_largest_photo_file_id(message: dict) -> str | None:
+    photos = message.get("photo")
+    if not isinstance(photos, list):
+        return None
+    best_file_id: str | None = None
+    best_size = -1
+    for item in photos:
+        if not isinstance(item, dict):
+            continue
+        file_id = str(item.get("file_id", "")).strip()
+        if not file_id:
+            continue
+        raw_size = item.get("file_size", 0)
+        try:
+            size = int(raw_size)
+        except Exception:
+            size = 0
+        if size >= best_size:
+            best_size = size
+            best_file_id = file_id
+    return best_file_id
+
+
 def extract_image_saved_paths(text: str) -> list[str]:
     result: list[str] = []
     if not text:
@@ -81,6 +109,40 @@ def extract_image_saved_paths(text: str) -> list[str]:
     return result
 
 
+def send_generated_images_from_paths(
+    client: TelegramClient,
+    chat_id: int,
+    message_id: int,
+    image_paths: list[str],
+) -> None:
+    seen: set[str] = set()
+    for image_path in image_paths:
+        if image_path in seen:
+            continue
+        seen.add(image_path)
+        resolved = Path(image_path).expanduser()
+        if not resolved.exists() or not resolved.is_file():
+            client.send_message(
+                chat_id,
+                f"image send skipped: file not found: {resolved}",
+                reply_to_message_id=message_id,
+            )
+            continue
+        try:
+            client.send_photo(
+                chat_id,
+                str(resolved),
+                caption=f"generated image\nsource: {resolved}",
+                reply_to_message_id=message_id,
+            )
+        except Exception as exc:
+            client.send_message(
+                chat_id,
+                f"image send error: {exc}",
+                reply_to_message_id=message_id,
+            )
+
+
 def process_update(
     update: dict,
     sessions: dict[int, CodingBot],
@@ -88,6 +150,9 @@ def process_update(
     bot_factory,
     allowed_chat_ids: set[int] | None,
 ) -> None:
+    message = update.get("message")
+    if not isinstance(message, dict):
+        return
     payload = extract_message_payload(update)
     if payload is None:
         return
@@ -242,6 +307,71 @@ def process_update(
         )
         return
 
+    photo_file_id = extract_largest_photo_file_id(message)
+    if photo_file_id and not text.startswith("/"):
+        if not text.strip():
+            client.send_message(
+                chat_id,
+                "photo received. add a caption describing the edit, for example: "
+                "'keep subject, change background to white'.",
+                reply_to_message_id=message_id,
+            )
+            return
+
+        bot = sessions.get(chat_id)
+        if bot is None:
+            bot = bot_factory()
+            sessions[chat_id] = bot
+        registry = getattr(bot, "tool_registry", None)
+        if registry is None or not hasattr(registry, "call"):
+            client.send_message(
+                chat_id,
+                "image edit unavailable: tool runtime is missing.",
+                reply_to_message_id=message_id,
+            )
+            return
+
+        try:
+            file_info = client.get_file(photo_file_id)
+            file_path = str(file_info.get("file_path", "")).strip()
+            if not file_path:
+                raise RuntimeError("telegram getFile returned empty file_path")
+            image_bytes = client.download_file(file_path)
+            input_image = base64.b64encode(image_bytes).decode("ascii")
+        except Exception as exc:
+            client.send_message(
+                chat_id,
+                f"image fetch error: {exc}",
+                reply_to_message_id=message_id,
+            )
+            return
+
+        payload_obj = {
+            "mode": "image_edit",
+            "prompt": text.strip(),
+            "input_image": input_image,
+        }
+        plugin_out = str(
+            registry.call("nano_banana_image", json.dumps(payload_obj, ensure_ascii=True))
+        )
+        if plugin_out.startswith("unknown tool:"):
+            plugin_out = "image edit unavailable: install/enable src/plugins/nano_banana_image.py"
+
+        chunks = chunk_message(plugin_out or "(empty response)")
+        for index, chunk in enumerate(chunks):
+            client.send_message(
+                chat_id,
+                chunk,
+                reply_to_message_id=message_id if index == 0 else None,
+            )
+        send_generated_images_from_paths(
+            client,
+            chat_id,
+            message_id,
+            extract_image_saved_paths(plugin_out),
+        )
+        return
+
     bot = sessions.get(chat_id)
     if bot is None:
         bot = bot_factory()
@@ -270,29 +400,9 @@ def process_update(
             reply_to_message_id=message_id if index == 0 else None,
         )
 
-    seen: set[str] = set()
-    for image_path in generated_image_paths:
-        if image_path in seen:
-            continue
-        seen.add(image_path)
-        resolved = Path(image_path).expanduser()
-        if not resolved.exists() or not resolved.is_file():
-            client.send_message(
-                chat_id,
-                f"image send skipped: file not found: {resolved}",
-                reply_to_message_id=message_id,
-            )
-            continue
-        try:
-            client.send_photo(
-                chat_id,
-                str(resolved),
-                caption=f"generated image\nsource: {resolved}",
-                reply_to_message_id=message_id,
-            )
-        except Exception as exc:
-            client.send_message(
-                chat_id,
-                f"image send error: {exc}",
-                reply_to_message_id=message_id,
-            )
+    send_generated_images_from_paths(
+        client,
+        chat_id,
+        message_id,
+        generated_image_paths,
+    )

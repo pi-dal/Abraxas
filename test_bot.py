@@ -519,6 +519,90 @@ class BotTests(unittest.TestCase):
         self.assertIsNone(result)
         self.assertEqual(len(bot.messages), 3)
 
+    def test_estimate_message_tokens_counts_tool_calls(self):
+        bot = core_bot.CodingBot.__new__(core_bot.CodingBot)
+        messages = [
+            {"role": "system", "content": "sys"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "nano_banana_image",
+                            "arguments": "x" * 8000,
+                        },
+                    }
+                ],
+            },
+        ]
+        estimated = core_bot.CodingBot._estimate_message_tokens(bot, messages)
+        self.assertGreater(estimated, 1000)
+
+    def test_ask_retries_once_on_context_overflow(self):
+        class _FakeToolRegistry:
+            def tool_specs(self):
+                return []
+
+            def call(self, name, arguments):
+                _ = (name, arguments)
+                return ""
+
+        class _Message:
+            def __init__(self, content: str):
+                self.content = content
+                self.tool_calls = []
+
+        class _Response:
+            def __init__(self, content: str):
+                self.choices = [SimpleNamespace(message=_Message(content))]
+
+        class _Completions:
+            def __init__(self):
+                self.calls = 0
+
+            def create(self, **kwargs):
+                _ = kwargs
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError(
+                        "Error code: 400 - {'error': {'code': '1210', 'message': "
+                        "\"input tokens exceeds maximum context length\"}}"
+                    )
+                return _Response("ok")
+
+        completions = _Completions()
+        bot = core_bot.CodingBot.__new__(core_bot.CodingBot)
+        bot.client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+        bot.model = "glm-4.7"
+        bot.tool_registry = _FakeToolRegistry()
+        bot.memory_runtime = None
+        bot.auto_braindump_enabled = False
+        bot.auto_compact_max_tokens = 0
+        bot.auto_compact_keep_last_messages = 2
+        bot.auto_compact_instructions = None
+        bot.messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "older"},
+            {"role": "assistant", "content": "older-reply"},
+        ]
+        compactions = {"count": 0}
+
+        def _compact_stub(keep_last_messages=12, instructions=None):
+            _ = (keep_last_messages, instructions)
+            compactions["count"] += 1
+            bot.messages = [bot.messages[0], {"role": "assistant", "content": "[compaction_summary]\ntrim"}]
+            return "session compacted"
+
+        bot.compact_session = _compact_stub
+
+        out = core_bot.CodingBot.ask(bot, "make image")
+        self.assertEqual(out, "ok")
+        self.assertEqual(compactions["count"], 1)
+        self.assertEqual(completions.calls, 2)
+
     def test_compact_session_writes_memory_before_rewrite(self):
         class _FakeMemory:
             def __init__(self):

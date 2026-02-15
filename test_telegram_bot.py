@@ -24,6 +24,8 @@ class _FakeClient:
         self.sent = []
         self.commands_synced = []
         self.photos = []
+        self.file_info = {}
+        self.downloads = {}
 
     def send_message(self, chat_id, text, reply_to_message_id=None):
         self.sent.append(
@@ -48,6 +50,12 @@ class _FakeClient:
             }
         )
         return {"ok": True}
+
+    def get_file(self, file_id):
+        return self.file_info.get(file_id, {"file_path": f"photos/{file_id}.jpg"})
+
+    def download_file(self, file_path):
+        return self.downloads.get(file_path, b"fake-image-bytes")
 
 
 class _FakeBot:
@@ -209,6 +217,90 @@ class TelegramBotTests(unittest.TestCase):
             self.assertIn("image generated.", client.sent[-1]["text"])
             self.assertEqual(len(client.photos), 1)
             self.assertEqual(client.photos[0]["photo"], image_path)
+
+    def test_process_update_photo_caption_routes_to_nano_banana_plugin(self):
+        class _PhotoRegistry:
+            def __init__(self, generated_image_path):
+                self.calls = []
+                self.generated_image_path = generated_image_path
+
+            def tool_specs(self):
+                return []
+
+            def call(self, name, arguments):
+                self.calls.append((name, arguments))
+                return f"image_saved: {self.generated_image_path}\nstatus: ok"
+
+        class _PhotoBot(_FakeBot):
+            def __init__(self, generated_image_path):
+                super().__init__()
+                self.tool_registry = _PhotoRegistry(generated_image_path)
+
+            def ask(self, text, on_tool_result=None):
+                _ = (text, on_tool_result)
+                raise AssertionError("photo edit flow should not call bot.ask")
+
+        with tempfile.TemporaryDirectory() as td:
+            generated_path = os.path.join(td, "edited.png")
+            with open(generated_path, "wb") as f:
+                f.write(b"edited")
+
+            bot = _PhotoBot(generated_path)
+            sessions = {7: bot}
+            client = _FakeClient()
+            client.file_info["photo-big"] = {"file_path": "telegram/path/photo-big.jpg"}
+            client.downloads["telegram/path/photo-big.jpg"] = b"input-photo"
+
+            process_update(
+                {
+                    "update_id": 101,
+                    "message": {
+                        "message_id": 56,
+                        "chat": {"id": 7},
+                        "caption": "keep face, change background to white",
+                        "photo": [
+                            {"file_id": "photo-small", "file_size": 100},
+                            {"file_id": "photo-big", "file_size": 500},
+                        ],
+                    },
+                },
+                sessions,
+                client,
+                lambda: _FakeBot(),
+                {7},
+            )
+
+            self.assertTrue(bot.tool_registry.calls)
+            name, arguments = bot.tool_registry.calls[0]
+            self.assertEqual(name, "nano_banana_image")
+            self.assertIn('"mode": "image_edit"', arguments)
+            self.assertIn("change background to white", arguments)
+            self.assertIn('"input_image"', arguments)
+            self.assertEqual(len(client.photos), 1)
+            self.assertEqual(client.photos[0]["photo"], generated_path)
+
+    def test_process_update_photo_without_caption_prompts_for_edit_text(self):
+        bot = _FakeBot()
+        sessions = {7: bot}
+        client = _FakeClient()
+
+        process_update(
+            {
+                "update_id": 102,
+                "message": {
+                    "message_id": 57,
+                    "chat": {"id": 7},
+                    "photo": [{"file_id": "photo-only", "file_size": 400}],
+                },
+            },
+            sessions,
+            client,
+            lambda: _FakeBot(),
+            {7},
+        )
+
+        self.assertTrue(client.sent)
+        self.assertIn("photo received", client.sent[-1]["text"])
 
     def test_process_update_help_mentions_compact(self):
         sessions = {}

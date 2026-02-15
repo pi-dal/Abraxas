@@ -1,3 +1,4 @@
+import json
 from typing import Any, Callable
 
 from openai import OpenAI
@@ -293,7 +294,46 @@ class CodingBot:
             if not isinstance(content, str):
                 content = str(content)
             total_chars += len(content) + 12
+            tool_calls = message.get("tool_calls")
+            if tool_calls:
+                try:
+                    total_chars += len(json.dumps(tool_calls, ensure_ascii=True))
+                except Exception:
+                    total_chars += len(str(tool_calls))
         return max(1, total_chars // 4)
+
+    @staticmethod
+    def _is_context_overflow_error(exc: Exception) -> bool:
+        text = str(exc).lower()
+        markers = (
+            "maximum context length",
+            "input tokens exceeds",
+            "context length",
+            "too many tokens",
+            "\"code\": \"1210\"",
+            "'code': '1210'",
+        )
+        return any(marker in text for marker in markers)
+
+    def _recover_from_context_overflow(self) -> str:
+        keep_last_messages = max(
+            1,
+            min(4, int(getattr(self, "auto_compact_keep_last_messages", 2))),
+        )
+        result = self.compact_session(
+            keep_last_messages=keep_last_messages,
+            instructions=(
+                "Emergency compact due to context overflow. Keep current user intent, "
+                "constraints, and next actions. Drop large payloads and base64/tool blobs."
+            ),
+        )
+        if "nothing to compact" in result or "no conversation messages" in result:
+            conversation = self.messages[1:] if len(self.messages) > 1 else []
+            if conversation:
+                recent = self._sanitize_recent_messages(conversation[-2:])
+                self.messages = [self.messages[0]] + recent
+                return "session compacted: emergency trim for context overflow."
+        return result
 
     def _auto_compact_if_needed(self, next_user_text: str = "") -> str | None:
         max_tokens = getattr(self, "auto_compact_max_tokens", DEFAULT_AUTO_COMPACT_MAX_TOKENS)
@@ -368,14 +408,22 @@ class CodingBot:
             except Exception:
                 pass
         self.messages.append({"role": "user", "content": user_text})
+        overflow_retried = False
         while True:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=self.messages,
-                tools=self.tool_registry.tool_specs(),
-                tool_choice="auto",
-                temperature=0.2,
-            )
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=self.messages,
+                    tools=self.tool_registry.tool_specs(),
+                    tool_choice="auto",
+                    temperature=0.2,
+                )
+            except Exception as exc:
+                if not overflow_retried and self._is_context_overflow_error(exc):
+                    self._recover_from_context_overflow()
+                    overflow_retried = True
+                    continue
+                raise
             message = response.choices[0].message
             tool_calls = message.tool_calls or []
             entry = {"role": "assistant", "content": message.content or ""}
