@@ -6,10 +6,10 @@ Cover all image-generation modes documented in the Gemini guide while staying ba
 ## Source of truth
 - https://ai.google.dev/gemini-api/docs/image-generation
 
-## Model policy (Nano Banana Pro first)
-1. Default: `gemini-3-pro-image-preview` (Nano Banana Pro) for high-fidelity assets, complex instruction following, text rendering, and grounding.
+## Model policy
+1. Default: `gemini-3.1-flash-image-preview` for the standard image flow in this repo.
 2. Fallback: `gemini-2.5-flash-image` (Nano Banana) for speed/cost or high-volume rendering.
-3. If user asks "Nano Banana Pro", do not silently downgrade to 2.5 unless explicitly requested.
+3. If user asks for a specific Gemini image model, pass it explicitly instead of silently switching defaults.
 
 ## Mode coverage (must support all)
 1. `Image generation (text-to-image)`
@@ -44,7 +44,7 @@ Cover all image-generation modes documented in the Gemini guide while staying ba
 ### 1) Text-to-image
 ```bash
 API_KEY="${GEMINI_API_KEY}"
-MODEL="${MODEL:-gemini-3-pro-image-preview}"
+MODEL="${MODEL:-gemini-3.1-flash-image-preview}"
 PROMPT="<descriptive scene prompt>"
 
 curl -sS -X POST \

@@ -8,7 +8,7 @@ from typing import Any
 
 from core.tools import ToolPlugin
 
-DEFAULT_MODEL = "gemini-3-pro-image-preview"
+DEFAULT_MODEL = "gemini-3.1-flash-image-preview"
 FAST_MODEL = "gemini-2.5-flash-image"
 API_URL_TEMPLATE = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 

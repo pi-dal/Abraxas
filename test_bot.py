@@ -1195,7 +1195,7 @@ class BotTests(unittest.TestCase):
         skill_path = pathlib.Path(__file__).resolve().parent / "src" / "skills" / "nano-banana-pro-photo.md"
         self.assertTrue(skill_path.exists())
         content = skill_path.read_text(encoding="utf-8")
-        self.assertIn("gemini-3-pro-image-preview", content)
+        self.assertIn("gemini-3.1-flash-image-preview", content)
         self.assertIn("gemini-2.5-flash-image", content)
         self.assertIn("https://ai.google.dev/gemini-api/docs/image-generation", content)
         self.assertIn("Generate images in batch", content)
@@ -1219,6 +1219,13 @@ class BotTests(unittest.TestCase):
                 }
             )
         self.assertIn("missing GEMINI_API_KEY", out)
+
+    def test_nano_banana_plugin_uses_new_default_model(self):
+        nano_banana_image = self._load_nano_banana_plugin_module()
+        self.assertEqual(
+            nano_banana_image._resolve_model({}),
+            "gemini-3.1-flash-image-preview",
+        )
 
     def test_nano_banana_plugin_search_mode_adds_google_search_tool(self):
         nano_banana_image = self._load_nano_banana_plugin_module()
