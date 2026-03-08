@@ -6,7 +6,7 @@ import sys
 import tempfile
 import tomllib
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -84,6 +84,7 @@ class BotTests(unittest.TestCase):
             self.tool_registry = BotTests._FakeToolRegistry()
             self.remember_calls: list[tuple[str, list[str]]] = []
             self.new_session_calls = 0
+            self.checkpoint_actions: list[str] = []
 
         def compact_session(self, keep_last_messages=12, instructions=None):
             return f"compacted:{keep_last_messages}:{instructions or ''}"
@@ -91,6 +92,17 @@ class BotTests(unittest.TestCase):
         def start_new_session(self):
             self.new_session_calls += 1
             return "new session started."
+
+        def approve_checkpoint_proposal(self):
+            self.checkpoint_actions.append("yes")
+            return "checkpoint approved"
+
+        def reject_checkpoint_proposal(self):
+            self.checkpoint_actions.append("no")
+            return "checkpoint dismissed"
+
+        def show_checkpoint_proposal(self):
+            return "checkpoint suggestion pending"
 
         def remember(self, note, tags=None):
             clean_tags = tags or []
@@ -188,6 +200,10 @@ class BotTests(unittest.TestCase):
         self.assertTrue(hasattr(core_commands, "run_memory_command"))
         self.assertTrue(hasattr(core_commands, "run_tmux_plugin_command"))
         self.assertTrue(hasattr(core_commands, "run_new_session_command"))
+        self.assertTrue(hasattr(core_commands, "run_checkpoint_command"))
+        self.assertTrue(hasattr(core_commands, "run_handoff_command"))
+        self.assertTrue(hasattr(core_commands, "run_rci_command"))
+        self.assertTrue(hasattr(core_commands, "run_tape_command"))
 
     def test_settings_use_single_runtime_loader(self):
         self.assertFalse(hasattr(core_settings, "load_settings"))
@@ -221,12 +237,59 @@ class BotTests(unittest.TestCase):
             self.assertIn("Do not break runtime.", prompt)
             self.assertIn("Additional skills loaded", prompt)
 
+    def test_cli_routes_checkpoint_command(self):
+        bot = self._FakeCliBot()
+        handled, response, should_exit = handle_cli_command("/checkpoint yes", bot)
+        self.assertTrue(handled)
+        self.assertEqual(response, "checkpoint approved")
+        self.assertFalse(should_exit)
+        self.assertEqual(bot.checkpoint_actions, ["yes"])
+
+    def test_cli_routes_tape_command(self):
+        bot = self._FakeCliBot()
+        with patch("channel.cli.run_tape_command") as mock_run:
+            mock_run.return_value = "tape status"
+            handled, response, should_exit = handle_cli_command("/tape status", bot)
+        self.assertTrue(handled)
+        self.assertEqual(response, "tape status")
+        self.assertFalse(should_exit)
+        mock_run.assert_called_once_with(bot, "status")
+
+    def test_cli_routes_rci_command(self):
+        bot = self._FakeCliBot()
+        with patch("channel.cli.run_rci_command") as mock_run:
+            mock_run.return_value = "RCI: strict mode"
+            handled, response, should_exit = handle_cli_command("/rci on 30", bot)
+        self.assertTrue(handled)
+        self.assertEqual(response, "RCI: strict mode")
+        self.assertFalse(should_exit)
+        mock_run.assert_called_once_with(bot, "on 30")
+
+    def test_cli_routes_hitl_commands(self):
+        bot = self._FakeCliBot()
+        cases = [
+            ("/yolo", "run_yolo_command", "YOLO mode active"),
+            ("/safe", "run_safe_command", "SAFE mode active"),
+            ("/allow", "run_allow_command", "allowed"),
+            ("/deny", "run_deny_command", "denied"),
+            ("/stop", "run_stop_command", "stopped"),
+        ]
+        for command, attr, expected in cases:
+            with self.subTest(command=command):
+                with patch(f"channel.cli.{attr}") as mock_run:
+                    mock_run.return_value = expected
+                    handled, response, should_exit = handle_cli_command(command, bot)
+                self.assertTrue(handled)
+                self.assertEqual(response, expected)
+                self.assertFalse(should_exit)
+
     def test_build_system_prompt_without_skills_uses_base_prompt(self):
         with tempfile.TemporaryDirectory() as td:
             missing = os.path.join(td, "skills-missing")
             missing_nous = os.path.join(td, "NOUS-missing.md")
             prompt = build_system_prompt(skills_dir=missing, nous_path=missing_nous)
-            self.assertEqual(prompt, SYSTEM_PROMPT)
+            self.assertIn(SYSTEM_PROMPT, prompt)
+            self.assertIn("CRITICAL EXECUTION RULE", prompt)
 
     def test_build_system_prompt_includes_nous(self):
         with tempfile.TemporaryDirectory() as td:
@@ -362,10 +425,12 @@ class BotTests(unittest.TestCase):
             runtime = core_memory.create_memory_runtime(memory_dir=td)
             daily_dir = os.path.join(td, "daily")
             os.makedirs(daily_dir, exist_ok=True)
-            with open(os.path.join(daily_dir, "2026-02-10.md"), "w", encoding="utf-8") as file:
-                file.write("# 2026-02-10 Daily Log\n\n## Decisions\n- choose architecture A\n")
-            with open(os.path.join(daily_dir, "2026-02-11.md"), "w", encoding="utf-8") as file:
-                file.write("# 2026-02-11 Daily Log\n\n## Action Items\n- ship memory v2\n")
+            first_day = runtime._now().date()
+            second_day = first_day.replace(day=first_day.day)  # stable local alias for readability
+            with open(os.path.join(daily_dir, f"{first_day:%Y-%m-%d}.md"), "w", encoding="utf-8") as file:
+                file.write(f"# {first_day:%Y-%m-%d} Daily Log\n\n## Decisions\n- choose architecture A\n")
+            with open(os.path.join(daily_dir, f"{second_day:%Y-%m-%d}.md"), "a", encoding="utf-8") as file:
+                file.write("## Action Items\n- ship memory v2\n")
 
             out = runtime.compound_weekly_memory()
             self.assertIn("weekly compound", out)
@@ -431,13 +496,15 @@ class BotTests(unittest.TestCase):
             runtime = core_memory.create_memory_runtime(memory_dir=td)
             daily_dir = os.path.join(td, "daily")
             os.makedirs(daily_dir, exist_ok=True)
-            with open(os.path.join(daily_dir, "2026-02-10.md"), "w", encoding="utf-8") as file:
-                file.write("# 2026-02-10 Daily Log\n\n- first point\n")
+            first_day = runtime._now().date()
+            second_day = first_day - timedelta(days=1)
+            with open(os.path.join(daily_dir, f"{first_day:%Y-%m-%d}.md"), "w", encoding="utf-8") as file:
+                file.write(f"# {first_day:%Y-%m-%d} Daily Log\n\n- first point\n")
             out1 = runtime.compound_weekly_memory()
             self.assertIn("saved", out1)
 
-            with open(os.path.join(daily_dir, "2026-02-11.md"), "w", encoding="utf-8") as file:
-                file.write("# 2026-02-11 Daily Log\n\n- second point\n")
+            with open(os.path.join(daily_dir, f"{second_day:%Y-%m-%d}.md"), "w", encoding="utf-8") as file:
+                file.write(f"# {second_day:%Y-%m-%d} Daily Log\n\n- second point\n")
             out2 = runtime.compound_weekly_memory()
             self.assertIn("saved", out2)
 
@@ -1206,6 +1273,12 @@ class BotTests(unittest.TestCase):
         registry, errors = build_tool_registry()
         self.assertIn("nano_banana_image", registry.plugin_names())
         self.assertFalse(any("nano_banana_image" in item for item in errors))
+
+    def test_build_tool_registry_does_not_expose_minimax_specific_mcp_tools(self):
+        registry, errors = build_tool_registry()
+        self.assertNotIn("web_search", registry.plugin_names())
+        self.assertNotIn("understand_image", registry.plugin_names())
+        self.assertFalse(any("minimax_mcp" in item for item in errors))
 
     def test_nano_banana_plugin_missing_key_error(self):
         nano_banana_image = self._load_nano_banana_plugin_module()

@@ -25,32 +25,100 @@ class _FakeClient:
         self.sent = []
         self.commands_synced = []
         self.photos = []
+        self.documents = []
         self.file_info = {}
         self.downloads = {}
 
-    def send_message(self, chat_id, text, reply_to_message_id=None):
+    def send_message(
+        self,
+        chat_id,
+        text,
+        reply_to_message_id=None,
+        parse_mode=None,
+        reply_markup=None,
+        message_thread_id=None,
+    ):
         self.sent.append(
             {
                 "chat_id": chat_id,
                 "text": text,
                 "reply_to_message_id": reply_to_message_id,
+                "parse_mode": parse_mode,
+                "reply_markup": reply_markup,
+                "message_thread_id": message_thread_id,
             }
         )
+        return {"ok": True, "message_id": len(self.sent)}
 
     def set_my_commands(self, commands):
         self.commands_synced.append(commands)
         return True
 
-    def send_photo(self, chat_id, photo, caption=None, reply_to_message_id=None):
+    def send_photo(
+        self,
+        chat_id,
+        photo,
+        caption=None,
+        reply_to_message_id=None,
+        message_thread_id=None,
+    ):
         self.photos.append(
             {
                 "chat_id": chat_id,
                 "photo": photo,
                 "caption": caption,
                 "reply_to_message_id": reply_to_message_id,
+                "message_thread_id": message_thread_id,
             }
         )
         return {"ok": True}
+
+    def send_document(
+        self,
+        chat_id,
+        document,
+        caption=None,
+        reply_to_message_id=None,
+        filename=None,
+        message_thread_id=None,
+    ):
+        self.documents.append(
+            {
+                "chat_id": chat_id,
+                "document": document,
+                "caption": caption,
+                "reply_to_message_id": reply_to_message_id,
+                "filename": filename,
+                "message_thread_id": message_thread_id,
+            }
+        )
+        return {"ok": True}
+
+    def edit_message_text(self, chat_id, message_id, text, parse_mode=None, reply_markup=None):
+        self.sent.append(
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": text,
+                "parse_mode": parse_mode,
+                "reply_markup": reply_markup,
+                "edited": True,
+            }
+        )
+        return {"ok": True}
+
+    def delete_message(self, chat_id, message_id):
+        return True
+
+    def answer_callback_query(self, callback_query_id, text=None, show_alert=None):
+        return True
+
+    def start_typing_action(self, chat_id, message_thread_id=None):
+        class _StopEvent:
+            def set(self):
+                return None
+
+        return _StopEvent()
 
     def get_file(self, file_id):
         return self.file_info.get(file_id, {"file_path": f"photos/{file_id}.jpg"})
@@ -120,6 +188,16 @@ class _FakeRegistry:
 
 
 class TelegramBotTests(unittest.TestCase):
+    def test_default_telegram_commands_include_runtime_controls(self):
+        names = [item["command"] for item in DEFAULT_TELEGRAM_COMMANDS]
+        self.assertIn("checkpoint", names)
+        self.assertIn("handoff", names)
+        self.assertIn("tape", names)
+        self.assertIn("rci", names)
+        self.assertIn("yolo", names)
+        self.assertIn("safe", names)
+        self.assertIn("stop", names)
+
     def test_extract_message_payload_text(self):
         payload = extract_message_payload(
             {
