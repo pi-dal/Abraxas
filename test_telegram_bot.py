@@ -3,7 +3,6 @@ import pathlib
 import sys
 import tempfile
 import unittest
-import json
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "src"))
 
@@ -170,20 +169,10 @@ class _FakeRegistry:
                 "type": "function",
                 "function": {"name": "bash", "description": "[builtin] Run shell command."},
             },
-            {
-                "type": "function",
-                "function": {"name": "telegram_config", "description": "[plugin] Configure telegram."},
-            },
-            {
-                "type": "function",
-                "function": {"name": "tmux_manager", "description": "[plugin] Manage tmux."},
-            },
         ]
 
     def call(self, name, arguments):
         self.calls.append((name, arguments))
-        if name == "tmux_manager":
-            return "tmux sessions: (none)"
         return f"unknown tool: {name}"
 
 
@@ -258,121 +247,46 @@ class TelegramBotTests(unittest.TestCase):
         self.assertEqual(client.sent[1]["text"], "echo:B")
         self.assertEqual(client.sent[0]["reply_to_message_id"], 11)
 
-    def test_process_update_sends_generated_image_from_tool_output(self):
+    def test_process_update_photo_caption_routes_to_multimodal_ask(self):
         class _PhotoBot(_FakeBot):
-            def __init__(self, image_path):
+            def __init__(self):
                 super().__init__()
-                self.image_path = image_path
-
-            def ask(self, text, on_tool_result=None):
-                _ = text
-                if on_tool_result is not None:
-                    on_tool_result(
-                        "nano_banana_image",
-                        '{"mode":"text_to_image"}',
-                        json.dumps(
-                            {
-                                "ok": True,
-                                "mode": "text_to_image",
-                                "images": [{"local_path": self.image_path}],
-                            }
-                        ),
-                    )
-                return "image generated."
-
-        with tempfile.TemporaryDirectory() as td:
-            image_path = os.path.join(td, "photo.png")
-            with open(image_path, "wb") as f:
-                f.write(b"fake-image")
-
-            bot = _PhotoBot(image_path)
-            sessions = {7: bot}
-            client = _FakeClient()
-            process_update(
-                {
-                    "update_id": 100,
-                    "message": {"message_id": 55, "chat": {"id": 7}, "text": "draw a cat"},
-                },
-                sessions,
-                client,
-                lambda: _FakeBot(),
-                {7},
-            )
-
-            self.assertIn("image generated.", client.sent[0]["text"])
-            self.assertEqual(len(client.photos), 1)
-            self.assertEqual(client.photos[0]["photo"], image_path)
-            self.assertIn("image addresses", client.sent[-1]["text"])
-            self.assertIn(image_path, client.sent[-1]["text"])
-
-    def test_process_update_photo_caption_routes_to_nano_banana_plugin(self):
-        class _PhotoRegistry:
-            def __init__(self, generated_image_path):
                 self.calls = []
-                self.generated_image_path = generated_image_path
 
-            def tool_specs(self):
-                return []
+            def ask(self, text, user_content=None):
+                self.calls.append({"text": text, "user_content": user_content})
+                return "image understood."
 
-            def call(self, name, arguments):
-                self.calls.append((name, arguments))
-                return json.dumps(
-                    {
-                        "ok": True,
-                        "mode": "image_edit",
-                        "images": [{"local_path": self.generated_image_path}],
-                    }
-                )
+        bot = _PhotoBot()
+        sessions = {7: bot}
+        client = _FakeClient()
+        client.file_info["photo-big"] = {"file_path": "telegram/path/photo-big.jpg"}
+        client.downloads["telegram/path/photo-big.jpg"] = b"input-photo"
 
-        class _PhotoBot(_FakeBot):
-            def __init__(self, generated_image_path):
-                super().__init__()
-                self.tool_registry = _PhotoRegistry(generated_image_path)
-
-            def ask(self, text, on_tool_result=None):
-                _ = (text, on_tool_result)
-                raise AssertionError("photo edit flow should not call bot.ask")
-
-        with tempfile.TemporaryDirectory() as td:
-            generated_path = os.path.join(td, "edited.png")
-            with open(generated_path, "wb") as f:
-                f.write(b"edited")
-
-            bot = _PhotoBot(generated_path)
-            sessions = {7: bot}
-            client = _FakeClient()
-            client.file_info["photo-big"] = {"file_path": "telegram/path/photo-big.jpg"}
-            client.downloads["telegram/path/photo-big.jpg"] = b"input-photo"
-
-            process_update(
-                {
-                    "update_id": 101,
-                    "message": {
-                        "message_id": 56,
-                        "chat": {"id": 7},
-                        "caption": "keep face, change background to white",
-                        "photo": [
-                            {"file_id": "photo-small", "file_size": 100},
-                            {"file_id": "photo-big", "file_size": 500},
-                        ],
-                    },
+        process_update(
+            {
+                "update_id": 101,
+                "message": {
+                    "message_id": 56,
+                    "chat": {"id": 7},
+                    "caption": "keep face, change background to white",
+                    "photo": [
+                        {"file_id": "photo-small", "file_size": 100},
+                        {"file_id": "photo-big", "file_size": 500},
+                    ],
                 },
-                sessions,
-                client,
-                lambda: _FakeBot(),
-                {7},
-            )
+            },
+            sessions,
+            client,
+            lambda: _FakeBot(),
+            {7},
+        )
 
-            self.assertTrue(bot.tool_registry.calls)
-            name, arguments = bot.tool_registry.calls[0]
-            self.assertEqual(name, "nano_banana_image")
-            self.assertIn('"mode": "image_edit"', arguments)
-            self.assertIn("change background to white", arguments)
-            self.assertIn('"input_image"', arguments)
-            self.assertEqual(len(client.photos), 1)
-            self.assertEqual(client.photos[0]["photo"], generated_path)
-            self.assertIn("image addresses", client.sent[-1]["text"])
-            self.assertIn(generated_path, client.sent[-1]["text"])
+        self.assertEqual(len(bot.calls), 1)
+        self.assertEqual(bot.calls[0]["text"], "keep face, change background to white")
+        self.assertIsInstance(bot.calls[0]["user_content"], list)
+        self.assertEqual(len(client.photos), 0)
+        self.assertIn("image understood.", client.sent[-1]["text"])
 
     def test_process_update_photo_without_caption_prompts_for_edit_text(self):
         bot = _FakeBot()
@@ -456,7 +370,6 @@ class TelegramBotTests(unittest.TestCase):
         self.assertIn("I am Abraxas", client.sent[0]["text"])
         self.assertIn("/commands", client.sent[0]["text"])
         self.assertIn("normal language", client.sent[0]["text"])
-        self.assertIn("/tmux", client.sent[0]["text"])
         self.assertIn("/memory", client.sent[0]["text"])
 
     def test_process_update_commands_lists_inventory(self):
@@ -484,12 +397,9 @@ class TelegramBotTests(unittest.TestCase):
 
                 text = client.sent[-1]["text"]
                 self.assertIn("Capabilities", text)
-                self.assertIn("/tmux", text)
                 self.assertIn("builtin tools", text)
                 self.assertIn("bash", text)
-                self.assertIn("plugin tools", text)
-                self.assertIn("telegram_config", text)
-                self.assertIn("tmux_manager", text)
+                self.assertIn("plugin tools: (none)", text)
                 self.assertIn("skills", text)
                 self.assertIn("alpha.md", text)
                 self.assertIn("beta.txt", text)
@@ -549,9 +459,9 @@ class TelegramBotTests(unittest.TestCase):
         self.assertTrue(result)
         self.assertEqual(client.commands_synced[-1], DEFAULT_TELEGRAM_COMMANDS)
 
-    def test_default_commands_include_tmux(self):
+    def test_default_commands_drop_tmux(self):
         names = [item["command"] for item in DEFAULT_TELEGRAM_COMMANDS]
-        self.assertIn("tmux", names)
+        self.assertNotIn("tmux", names)
         self.assertIn("memory", names)
         self.assertIn("new", names)
         self.assertIn("photos", names)
@@ -582,25 +492,6 @@ class TelegramBotTests(unittest.TestCase):
         self.assertIsNot(sessions[7], old_bot)
         self.assertIs(sessions[7], created[0])
         self.assertIn("new session started", client.sent[-1]["text"])
-
-    def test_process_update_tmux_command(self):
-        bot = _FakeBot()
-        sessions = {7: bot}
-        client = _FakeClient()
-        process_update(
-            {
-                "update_id": 88,
-                "message": {"message_id": 45, "chat": {"id": 7}, "text": "/tmux list"},
-            },
-            sessions,
-            client,
-            lambda: _FakeBot(),
-            {7},
-        )
-        self.assertTrue(bot.tool_registry.calls)
-        self.assertEqual(bot.tool_registry.calls[0][0], "tmux_manager")
-        self.assertIn("list", bot.tool_registry.calls[0][1])
-        self.assertIn("tmux sessions", client.sent[-1]["text"])
 
     def test_process_update_memory_status(self):
         class _Runtime:

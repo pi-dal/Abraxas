@@ -21,7 +21,6 @@ from core.commands import (
     run_remember_command,
     run_rci_command,
     run_tape_command,
-    run_tmux_plugin_command,
     run_yolo_command,
     run_safe_command,
     run_allow_command,
@@ -260,10 +259,6 @@ def handle_cli_command(line: str, bot: CodingBot) -> tuple[bool, str, bool]:
     if line == "/remember" or line.startswith("/remember "):
         raw_args = line[len("/remember") :].strip()
         return True, run_remember_command(bot, raw_args), False
-
-    if line == "/tmux" or line.startswith("/tmux "):
-        raw_args = line[len("/tmux") :].strip()
-        return True, run_tmux_plugin_command(bot, raw_args), False
 
     if line.startswith("/"):
         return True, "unknown command. use /help.", False

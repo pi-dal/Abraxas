@@ -69,6 +69,8 @@ Thumbs.db
 # Logs
 *.log
 
-# Database
+# Local files
+docs/plans/
+tmp/
 *.db
 *.sqlite3

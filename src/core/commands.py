@@ -1,4 +1,3 @@
-import json
 import os
 from pathlib import Path
 from typing import Any, Callable
@@ -25,7 +24,6 @@ DEFAULT_TELEGRAM_COMMANDS = [
     {"command": "help", "description": "Show help text"},
     {"command": "commands", "description": "List available commands"},
     {"command": "photos", "description": "send photo(s) by local path"},
-    {"command": "tmux", "description": "Tmux session manager"},
     {"command": "compact", "description": "Compact current chat session"},
     {"command": "checkpoint", "description": "Approve or dismiss a checkpoint suggestion"},
     {"command": "handoff", "description": "Handoff with summary"},
@@ -60,21 +58,8 @@ def build_help_text(commands: list[dict[str, str]] | None = None) -> str:
         "Use /safe, /yolo, /allow, /deny, /stop for execution control.",
         "Use /new to start a fresh conversation in this chat.",
         "Use /memory to inspect status or run memory/mission sync.",
-        "Use /tmux to list/create/send/log/kill tmux sessions for coding agents.",
     ]
     return "\n".join(lines)
-
-
-def run_tmux_plugin_command(bot: Any, raw_args: str) -> str:
-    registry = getattr(bot, "tool_registry", None)
-    if registry is None or not hasattr(registry, "call"):
-        return "tmux unavailable: plugin tool tmux_manager is not loaded"
-    payload = json.dumps({"command": (raw_args or "help").strip()}, ensure_ascii=True)
-    out = registry.call("tmux_manager", payload)
-    text = str(out)
-    if text.startswith("unknown tool:"):
-        return "tmux unavailable: install/enable src/plugins/tmux_manager.py"
-    return text
 
 
 def run_memory_command(bot: Any, raw_args: str) -> str:

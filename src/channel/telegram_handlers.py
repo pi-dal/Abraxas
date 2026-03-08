@@ -24,7 +24,6 @@ from core.commands import (
     run_rci_command,
     run_remember_command,
     run_tape_command,
-    run_tmux_plugin_command,
     run_yolo_command,
     run_safe_command,
     run_stop_command,
@@ -1351,15 +1350,6 @@ def process_update(
         _send(sync_text, reply_to_message_id=message_id)
         return
 
-    if text.startswith("/tmux"):
-        bot = get_or_create_session(sessions, chat_id, bot_factory)
-        raw = text[len("/tmux") :].strip()
-        out = run_tmux_plugin_command(bot, raw)
-        chunks = chunk_message(out)
-        for index, chunk in enumerate(chunks):
-            _send(chunk, reply_to_message_id=message_id if index == 0 else None)
-        return
-
     if text.startswith("/memory"):
         bot = get_or_create_session(sessions, chat_id, bot_factory)
         raw = text[len("/memory") :].strip()
@@ -1487,33 +1477,12 @@ def process_update(
             )
             return
 
-        registry = getattr(bot, "tool_registry", None)
-        if registry is not None and hasattr(registry, "call"):
-            payload = {
-                "mode": "image_edit",
-                "prompt": prompt_text,
-                "input_image": str(local_image_path),
-            }
-            output = str(registry.call("nano_banana_image", json.dumps(payload, ensure_ascii=False)))
-            paths, urls = extract_image_paths_and_urls(output)
-            send_generated_images_from_paths(
-                client,
-                chat_id,
-                message_id,
-                paths,
-                urls,
-                include_local_addresses=True,
-                message_thread_id=message_thread_id,
-            )
-            return
-
         prompt_text = text.strip() or "Please analyze this image first."
         user_text = prompt_text
         user_content = [
             {"type": "text", "text": prompt_text},
             {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{image_b64}"}},
         ]
-        _latest_image_context_by_chat[chat_id] = (mime_type, image_b64)
     elif document_file_id and isinstance(document, dict) and not text.startswith("/"):
         try:
             local_path, original_name, mime_type = _store_document_attachment(
@@ -1545,10 +1514,6 @@ def process_update(
                 {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{image_b64}"}},
             ]
 
-    generated_image_paths: list[str] = []
-    generated_image_urls: list[str] = []
-    generated_document_paths: list[str] = []
-    generated_document_urls: list[str] = []
     draft_reply = _TelegramDraftReply(
         client,
         chat_id,
@@ -1558,24 +1523,12 @@ def process_update(
         stream_settings=stream_settings,
     )
 
-    def _on_tool_result(name: str, _arguments: str, output: str) -> None:
-        if name in {"nano_banana_image", "send_telegram_photo"}:
-            paths, urls = extract_image_paths_and_urls(output)
-            generated_image_paths.extend(paths)
-            generated_image_urls.extend(urls)
-            return
-        if name == "send_telegram_file":
-            paths, urls = extract_document_paths_and_urls(output)
-            generated_document_paths.extend(paths)
-            generated_document_urls.extend(urls)
-            return
-
     typing_stop = start_typing_feedback(client, chat_id, message_thread_id=message_thread_id)
     try:
         reply = call_bot_ask(
             bot,
             user_text,
-            on_tool_result=_on_tool_result,
+            on_tool_result=None,
             on_partial_response=draft_reply.update,
             user_content=user_content,
         )
@@ -1584,32 +1537,5 @@ def process_update(
     finally:
         typing_stop.set()
 
-    if (
-        not generated_image_paths
-        and not generated_image_urls
-        and not generated_document_paths
-        and not generated_document_urls
-    ):
-        # Build Allow/Deny keyboard if this reply is an interception prompt.
-        keyboard = _build_intercepted_keyboard(bot, reply)
-        draft_reply.finalize(reply or "(empty response)", reply_markup=keyboard)
-    else:
-        draft_reply.finalize(reply or "(empty response)")
-
-    send_generated_images_from_paths(
-        client,
-        chat_id,
-        message_id,
-        generated_image_paths,
-        generated_image_urls,
-        include_local_addresses=True,
-        message_thread_id=message_thread_id,
-    )
-    send_generated_documents_from_paths(
-        client,
-        chat_id,
-        message_id,
-        generated_document_paths,
-        generated_document_urls,
-        message_thread_id=message_thread_id,
-    )
+    keyboard = _build_intercepted_keyboard(bot, reply)
+    draft_reply.finalize(reply or "(empty response)", reply_markup=keyboard)

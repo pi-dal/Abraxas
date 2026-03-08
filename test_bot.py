@@ -1,4 +1,3 @@
-import importlib.util
 import json
 import os
 import pathlib
@@ -42,17 +41,6 @@ from core.tools import (
 
 
 class BotTests(unittest.TestCase):
-    @staticmethod
-    def _load_nano_banana_plugin_module():
-        repo_root = pathlib.Path(__file__).resolve().parent
-        module_path = repo_root / "src" / "plugins" / "nano_banana_image.py"
-        spec = importlib.util.spec_from_file_location("nano_banana_image_test_module", module_path)
-        if spec is None or spec.loader is None:
-            raise RuntimeError("failed to load nano_banana_image plugin module spec")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module
-
     class _FakeToolRegistry:
         def __init__(self):
             self.calls: list[tuple[str, str]] = []
@@ -63,20 +51,10 @@ class BotTests(unittest.TestCase):
                     "type": "function",
                     "function": {"name": "bash", "description": "[builtin] bash tool"},
                 },
-                {
-                    "type": "function",
-                    "function": {"name": "demo_plugin", "description": "[plugin] plugin tool"},
-                },
-                {
-                    "type": "function",
-                    "function": {"name": "tmux_manager", "description": "[plugin] tmux tool"},
-                },
             ]
 
         def call(self, name: str, arguments: str):
             self.calls.append((name, arguments))
-            if name == "tmux_manager":
-                return "tmux sessions: (none)"
             return f"unknown tool: {name}"
 
     class _FakeCliBot:
@@ -198,7 +176,7 @@ class BotTests(unittest.TestCase):
         self.assertTrue(hasattr(core_commands, "build_help_text"))
         self.assertTrue(hasattr(core_commands, "build_commands_text"))
         self.assertTrue(hasattr(core_commands, "run_memory_command"))
-        self.assertTrue(hasattr(core_commands, "run_tmux_plugin_command"))
+        self.assertFalse(hasattr(core_commands, "run_tmux_plugin_command"))
         self.assertTrue(hasattr(core_commands, "run_new_session_command"))
         self.assertTrue(hasattr(core_commands, "run_checkpoint_command"))
         self.assertTrue(hasattr(core_commands, "run_handoff_command"))
@@ -930,36 +908,6 @@ class BotTests(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertIn("bad", errors[0])
 
-    def test_telegram_config_plugin_can_update_allowed_chat_ids(self):
-        keys = ["ABRAXAS_ENV_PATH"]
-        snapshot = {k: os.environ.get(k) for k in keys}
-        try:
-            with tempfile.TemporaryDirectory() as td:
-                env_path = os.path.join(td, ".env")
-                with open(env_path, "w", encoding="utf-8") as f:
-                    f.write(
-                        "API_KEY=test-key\n"
-                        "TELEGRAM_BOT_TOKEN=test-token\n"
-                        "ALLOWED_TELEGRAM_CHAT_IDS=1,2\n"
-                    )
-                os.environ["ABRAXAS_ENV_PATH"] = env_path
-                registry, errors = build_tool_registry(plugin_package="plugins")
-                self.assertEqual(errors, [])
-                self.assertIn("telegram_config", registry.plugin_names())
-                out = registry.call(
-                    "telegram_config",
-                    '{"action":"add_allowed_chat_id","chat_id":3}',
-                )
-                self.assertIn("updated", out)
-                show = registry.call("telegram_config", '{"action":"show"}')
-                self.assertIn('"allowed_telegram_chat_ids": "1,2,3"', show)
-        finally:
-            for k, v in snapshot.items():
-                if v is None:
-                    os.environ.pop(k, None)
-                else:
-                    os.environ[k] = v
-
     def test_reloadable_registry_hot_loads_new_plugin(self):
         with tempfile.TemporaryDirectory() as td:
             plugins_dir = os.path.join(td, "plugins")
@@ -1110,7 +1058,7 @@ class BotTests(unittest.TestCase):
                 self.assertFalse(should_exit)
                 self.assertIn("Capabilities", out)
                 self.assertIn("builtin tools: bash", out)
-                self.assertIn("plugin tools: demo_plugin", out)
+                self.assertIn("plugin tools: (none)", out)
                 self.assertIn("skills: alpha.md", out)
         finally:
             if env_snapshot is None:
@@ -1131,16 +1079,6 @@ class BotTests(unittest.TestCase):
         self.assertTrue(handled)
         self.assertFalse(should_exit)
         self.assertIn("Telegram-only", out)
-
-    def test_cli_tmux_command_routes_to_handler(self):
-        bot = self._FakeCliBot()
-        handled, out, should_exit = handle_cli_command("/tmux list", bot)
-        self.assertTrue(handled)
-        self.assertFalse(should_exit)
-        self.assertTrue(bot.tool_registry.calls)
-        self.assertEqual(bot.tool_registry.calls[0][0], "tmux_manager")
-        self.assertIn("list", bot.tool_registry.calls[0][1])
-        self.assertIn("tmux sessions", out)
 
     def test_cli_photos_command_lists_recent_images(self):
         previous_cwd = os.getcwd()
@@ -1258,101 +1196,19 @@ class BotTests(unittest.TestCase):
         self.assertIn("ToolPlugin", content)
         self.assertIn("core.tools", content)
 
-    def test_nano_banana_photo_skill_exists(self):
-        skill_path = pathlib.Path(__file__).resolve().parent / "src" / "skills" / "nano-banana-pro-photo.md"
-        self.assertTrue(skill_path.exists())
-        content = skill_path.read_text(encoding="utf-8")
-        self.assertIn("gemini-3.1-flash-image-preview", content)
-        self.assertIn("gemini-2.5-flash-image", content)
-        self.assertIn("https://ai.google.dev/gemini-api/docs/image-generation", content)
-        self.assertIn("Generate images in batch", content)
-        self.assertIn("Inpainting (Semantic masking)", content)
-        self.assertIn("Advanced composition: Combining multiple images", content)
-
-    def test_nano_banana_plugin_registers(self):
+    def test_build_tool_registry_default_runtime_has_only_builtin_tools(self):
         registry, errors = build_tool_registry()
-        self.assertIn("nano_banana_image", registry.plugin_names())
-        self.assertFalse(any("nano_banana_image" in item for item in errors))
+        self.assertEqual(registry.plugin_names(), ["bash"])
+        self.assertEqual(errors, [])
 
-    def test_build_tool_registry_does_not_expose_minimax_specific_mcp_tools(self):
+    def test_build_tool_registry_does_not_expose_removed_project_tools(self):
         registry, errors = build_tool_registry()
+        self.assertNotIn("nano_banana_image", registry.plugin_names())
+        self.assertNotIn("telegram_config", registry.plugin_names())
+        self.assertNotIn("tmux_manager", registry.plugin_names())
         self.assertNotIn("web_search", registry.plugin_names())
         self.assertNotIn("understand_image", registry.plugin_names())
         self.assertFalse(any("minimax_mcp" in item for item in errors))
-
-    def test_nano_banana_plugin_missing_key_error(self):
-        nano_banana_image = self._load_nano_banana_plugin_module()
-
-        with patch.dict(os.environ, {"GEMINI_API_KEY": ""}, clear=False):
-            out = nano_banana_image._handle(
-                {
-                    "mode": "text_to_image",
-                    "prompt": "A red apple on wooden table",
-                    "api_key": "",
-                }
-            )
-        self.assertIn("missing GEMINI_API_KEY", out)
-
-    def test_nano_banana_plugin_uses_new_default_model(self):
-        nano_banana_image = self._load_nano_banana_plugin_module()
-        self.assertEqual(
-            nano_banana_image._resolve_model({}),
-            "gemini-3.1-flash-image-preview",
-        )
-
-    def test_nano_banana_plugin_search_mode_adds_google_search_tool(self):
-        nano_banana_image = self._load_nano_banana_plugin_module()
-
-        body, err = nano_banana_image._build_single_request(
-            {"prompt": "today weather in shanghai"},
-            "search_grounded_generate",
-            "today weather in shanghai",
-        )
-        self.assertIsNone(err)
-        self.assertIn("tools", body)
-        self.assertEqual(body["tools"], [{"google_search": {}}])
-
-    def test_nano_banana_extract_output_defaults_output_dir(self):
-        nano_banana_image = self._load_nano_banana_plugin_module()
-        response_data = {
-            "candidates": [
-                {
-                    "content": {
-                        "parts": [
-                            {
-                                "inline_data": {
-                                    "mime_type": "image/png",
-                                    "data": "aGVsbG8=",
-                                }
-                            }
-                        ]
-                    }
-                }
-            ]
-        }
-
-        previous_cwd = os.getcwd()
-        try:
-            with tempfile.TemporaryDirectory() as td:
-                os.chdir(td)
-                out = nano_banana_image._extract_output({}, response_data, index=1)
-                self.assertTrue(out.get("ok"))
-                self.assertTrue(out.get("images"))
-                expected = os.path.join(td, "outputs", "images", "nano_banana_1_1.png")
-                self.assertTrue(os.path.exists(expected))
-                self.assertEqual(
-                    os.path.realpath(out["images"][0].get("local_path", "")),
-                    os.path.realpath(expected),
-                )
-        finally:
-            os.chdir(previous_cwd)
-
-    def test_nano_banana_handle_returns_structured_json(self):
-        nano_banana_image = self._load_nano_banana_plugin_module()
-        out = nano_banana_image._handle({"mode": "text_to_image"})
-        payload = json.loads(out)
-        self.assertIn("ok", payload)
-        self.assertIn("error", payload)
 
     def test_skill_installer_mentions_current_entrypoints(self):
         skill_path = pathlib.Path(__file__).resolve().parent / "src" / "skills" / "skill-installer.md"

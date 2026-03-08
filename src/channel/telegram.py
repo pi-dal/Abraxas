@@ -3,7 +3,6 @@ from core.commands import (
     build_commands_text,
     build_help_text,
     run_memory_command,
-    run_tmux_plugin_command,
 )
 
 from .telegram_client import TELEGRAM_API_BASE, TelegramClient, sync_telegram_commands
@@ -26,7 +25,6 @@ __all__ = [
     "TelegramClient",
     "build_help_text",
     "build_commands_text",
-    "run_tmux_plugin_command",
     "run_memory_command",
     "extract_message_payload",
     "parse_allowed_chat_ids",
