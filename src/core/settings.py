@@ -1,6 +1,25 @@
 import os
 
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except Exception:  # pragma: no cover - optional dependency path
+    def load_dotenv(path: str | None = None) -> bool:  # type: ignore[no-redef]
+        if not path or not os.path.exists(path):
+            return False
+        loaded = False
+        with open(path, "r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip("\"'")
+                if not key:
+                    continue
+                os.environ.setdefault(key, value)
+                loaded = True
+        return loaded
 
 DEFAULT_ENV_PATH = ".env"
 DEFAULT_BASE_URL = "https://api.z.ai/api/coding/paas/v4"
@@ -20,7 +39,15 @@ DEFAULT_NOUS_PATH = "src/core/NOUS.md"
 DEFAULT_NOUS_TZ = "Asia/Shanghai"
 DEFAULT_AUTO_COMPACT_MAX_TOKENS = 12000
 DEFAULT_AUTO_COMPACT_KEEP_LAST_MESSAGES = 12
+DEFAULT_CHECKPOINT_TOKEN_THRESHOLD = 12000
+DEFAULT_CHECKPOINT_RECENT_ENTRIES = 24
+DEFAULT_CONTEXT_RECENT_ENTRIES = 96
 DEFAULT_AUTO_BRAINDUMP_ENABLED = True
+DEFAULT_TELEGRAM_STREAM_MODE = "partial"
+DEFAULT_TELEGRAM_DRAFT_CHUNK_MIN_CHARS = 200
+DEFAULT_TELEGRAM_DRAFT_CHUNK_MAX_CHARS = 800
+DEFAULT_TELEGRAM_TEMP_DIR = "tmp/telegram_sessions"
+DEFAULT_TELEGRAM_TEMP_TTL_DAYS = 3
 
 
 def resolve_env_path(env_path: str | None = None) -> str:
@@ -101,9 +128,43 @@ def load_runtime_settings(env_path: str | None = None) -> dict[str, str | int | 
             DEFAULT_AUTO_COMPACT_KEEP_LAST_MESSAGES,
         ),
         "auto_compact_instructions": os.getenv("ABRAXAS_AUTO_COMPACT_INSTRUCTIONS") or None,
+        "checkpoint_token_threshold": _read_int_env(
+            "ABRAXAS_CHECKPOINT_TOKEN_THRESHOLD",
+            DEFAULT_CHECKPOINT_TOKEN_THRESHOLD,
+            allow_zero=True,
+        ),
+        "checkpoint_recent_entries": _read_int_env(
+            "ABRAXAS_CHECKPOINT_RECENT_ENTRIES",
+            DEFAULT_CHECKPOINT_RECENT_ENTRIES,
+        ),
+        "context_recent_entries": _read_int_env(
+            "ABRAXAS_CONTEXT_RECENT_ENTRIES",
+            DEFAULT_CONTEXT_RECENT_ENTRIES,
+        ),
         "auto_braindump_enabled": _read_bool_env(
             "ABRAXAS_AUTO_BRAINDUMP_ENABLED",
             DEFAULT_AUTO_BRAINDUMP_ENABLED,
+        ),
+        "telegram_stream_mode": os.getenv(
+            "ABRAXAS_TELEGRAM_STREAM_MODE",
+            DEFAULT_TELEGRAM_STREAM_MODE,
+        ),
+        "telegram_draft_chunk_min_chars": _read_int_env(
+            "ABRAXAS_TELEGRAM_DRAFT_CHUNK_MIN_CHARS",
+            DEFAULT_TELEGRAM_DRAFT_CHUNK_MIN_CHARS,
+        ),
+        "telegram_draft_chunk_max_chars": _read_int_env(
+            "ABRAXAS_TELEGRAM_DRAFT_CHUNK_MAX_CHARS",
+            DEFAULT_TELEGRAM_DRAFT_CHUNK_MAX_CHARS,
+        ),
+        "telegram_temp_dir": os.getenv(
+            "ABRAXAS_TELEGRAM_TEMP_DIR",
+            DEFAULT_TELEGRAM_TEMP_DIR,
+        ),
+        "telegram_temp_ttl_days": _read_int_env(
+            "ABRAXAS_TELEGRAM_TEMP_TTL_DAYS",
+            DEFAULT_TELEGRAM_TEMP_TTL_DAYS,
+            allow_zero=True,
         ),
         "nous_path": os.getenv("ABRAXAS_NOUS_PATH", DEFAULT_NOUS_PATH),
         "nous_tz": os.getenv("ABRAXAS_NOUS_TZ", DEFAULT_NOUS_TZ),

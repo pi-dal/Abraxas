@@ -22,6 +22,9 @@ def build_tool_registry(
 
     try:
         importlib.invalidate_caches()
+        for module_name in list(sys.modules.keys()):
+            if module_name == plugin_package or module_name.startswith(f"{plugin_package}."):
+                sys.modules.pop(module_name, None)
         package = importlib.import_module(plugin_package)
     except ModuleNotFoundError:
         return registry, errors
