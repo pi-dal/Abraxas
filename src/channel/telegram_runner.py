@@ -1,4 +1,5 @@
 import time
+import threading
 from typing import Any
 
 from core.bot import CodingBot
@@ -7,7 +8,12 @@ from core.scheduler import DailyScheduler, MultiDailyScheduler, WeeklyScheduler
 from core.settings import load_runtime_settings
 
 from .telegram_client import TelegramClient, sync_telegram_commands
-from .telegram_handlers import parse_allowed_chat_ids, process_update
+from .telegram_handlers import (
+    create_chat_session_bot,
+    extract_message_payload,
+    parse_allowed_chat_ids,
+    process_update,
+)
 from .telegram_scheduler import (
     run_daily_memory_sync,
     run_micro_memory_sync,
@@ -47,6 +53,8 @@ def run_telegram_bot(
         weekday=int(settings.get("memory_weekly_compound_weekday", 6)),
     )
     offset: int | None = None
+    in_flight_chat_workers: dict[int, threading.Thread] = {}
+    in_flight_lock = threading.Lock()
 
     while True:
         updates = client.get_updates(offset=offset, timeout=poll_timeout)
@@ -54,7 +62,118 @@ def run_telegram_bot(
             update_id = update.get("update_id")
             if isinstance(update_id, int):
                 offset = update_id + 1
-            process_update(update, sessions, client, bot_factory, allowed_chat_ids)
+            payload = extract_message_payload(update)
+            if payload is None:
+                # callback_query or other non-message update
+                # Extract chat_id for routing
+                cb = update.get("callback_query", {})
+                cb_msg = cb.get("message", {}) if isinstance(cb, dict) else {}
+                cb_chat = cb_msg.get("chat", {}) if isinstance(cb_msg, dict) else {}
+                cb_chat_id = cb_chat.get("id") if isinstance(cb_chat, dict) else None
+
+                if isinstance(cb_chat_id, int):
+                    # Allow/Deny/Always-Allow all invoke tool execution + LLM continuation
+                    # — run in a worker thread to keep polling loop unblocked.
+                    with in_flight_lock:
+                        active = in_flight_chat_workers.get(cb_chat_id)
+                        already_busy = active is not None and active.is_alive()
+
+                    if already_busy:
+                        # Don't queue a second HITL decision while bot is mid-execution
+                        client.answer_callback_query(
+                            str(cb.get("id", "")),
+                            text="Bot is busy — wait for current execution to finish.",
+                            show_alert=True,
+                        ) if isinstance(cb, dict) and cb.get("id") else None
+                    else:
+                        def _run_callback_update(
+                            chat_id_cb: int = cb_chat_id,
+                            update_payload: dict[str, Any] = update,
+                        ) -> None:
+                            try:
+                                process_update(
+                                    update_payload,
+                                    sessions,
+                                    client,
+                                    bot_factory,
+                                    allowed_chat_ids,
+                                )
+                            finally:
+                                with in_flight_lock:
+                                    current = in_flight_chat_workers.get(chat_id_cb)
+                                    if current is threading.current_thread():
+                                        in_flight_chat_workers.pop(chat_id_cb, None)
+
+                        cb_worker = threading.Thread(
+                            target=_run_callback_update,
+                            daemon=True,
+                            name=f"tg-cb-{cb_chat_id}",
+                        )
+                        with in_flight_lock:
+                            in_flight_chat_workers[cb_chat_id] = cb_worker
+                        cb_worker.start()
+                else:
+                    # Non-callback (e.g. channel posts) — process synchronously, no blocking
+                    process_update(update, sessions, client, bot_factory, allowed_chat_ids)
+
+            else:
+                chat_id, message_id, text = payload
+                normalized = text.strip()
+                is_command = normalized.startswith("/")
+                is_stop = normalized.startswith("/stop")
+
+                if not is_command:
+                    with in_flight_lock:
+                        active = in_flight_chat_workers.get(chat_id)
+                        if active is not None and active.is_alive():
+                            client.send_message(
+                                chat_id,
+                                "execution already in progress. send /stop to interrupt.",
+                                reply_to_message_id=message_id,
+                            )
+                            continue
+                        if chat_id not in sessions:
+                            sessions[chat_id] = create_chat_session_bot(bot_factory, chat_id)
+
+                        def _run_non_command_update(
+                            chat_id_for_cleanup: int = chat_id,
+                            update_payload: dict[str, Any] = update,
+                        ) -> None:
+                            try:
+                                process_update(
+                                    update_payload,
+                                    sessions,
+                                    client,
+                                    bot_factory,
+                                    allowed_chat_ids,
+                                )
+                            finally:
+                                with in_flight_lock:
+                                    current = in_flight_chat_workers.get(chat_id_for_cleanup)
+                                    if current is threading.current_thread():
+                                        in_flight_chat_workers.pop(chat_id_for_cleanup, None)
+
+                        worker = threading.Thread(
+                            target=_run_non_command_update,
+                            daemon=True,
+                            name=f"tg-chat-{chat_id}",
+                        )
+                        in_flight_chat_workers[chat_id] = worker
+                    worker.start()
+                elif is_stop:
+                    process_update(update, sessions, client, bot_factory, allowed_chat_ids)
+                else:
+                    with in_flight_lock:
+                        active = in_flight_chat_workers.get(chat_id)
+                        busy = active is not None and active.is_alive()
+                    if busy:
+                        client.send_message(
+                            chat_id,
+                            "execution in progress. use /stop first, then retry this command.",
+                            reply_to_message_id=message_id,
+                        )
+                        continue
+                    process_update(update, sessions, client, bot_factory, allowed_chat_ids)
             if tool_registry is not None:
                 for plugin_error in tool_registry.drain_errors():
                     print(f"plugin warning: {plugin_error}")
@@ -125,7 +244,7 @@ def main() -> None:
     run_telegram_bot(
         str(token),
         allowed_chat_ids=allowed_chat_ids,
-        bot_factory=lambda: CodingBot(tool_registry=tool_registry),
+        bot_factory=lambda session_id=None: CodingBot(tool_registry=tool_registry, session_id=session_id),
         tool_registry=tool_registry,
         runtime_settings=settings,
     )
