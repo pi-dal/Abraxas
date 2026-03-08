@@ -1,6 +1,8 @@
 import base64
 import json
 import os
+import re
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -87,6 +89,31 @@ def _image_part(image_b64: str, mime_type: str) -> dict[str, Any]:
             "data": image_b64,
         }
     }
+
+
+def _sanitize_output_prefix(value: str) -> str:
+    lowered = value.strip().lower()
+    if not lowered:
+        return ""
+    ascii_text = lowered.encode("ascii", "ignore").decode("ascii")
+    cleaned = re.sub(r"[^a-z0-9]+", "_", ascii_text).strip("_")
+    if not cleaned:
+        return ""
+    return cleaned[:64].strip("_")
+
+
+def _resolve_output_prefix(payload: dict[str, Any]) -> str:
+    explicit = str(payload.get("output_prefix", "")).strip()
+    if explicit:
+        sanitized = _sanitize_output_prefix(explicit)
+        return sanitized or "nano_banana"
+    if bool(payload.get("auto_prefix_from_prompt", False)):
+        explicit = str(payload.get("prompt", "")).strip()
+        sanitized = _sanitize_output_prefix(explicit)
+        if sanitized:
+            return sanitized
+        return f"img_{int(time.time()*1000)}"
+    return "nano_banana"
 
 
 def _build_generation_config(payload: dict[str, Any], *, include_text: bool = True) -> dict[str, Any]:
@@ -238,7 +265,7 @@ def _extract_output(payload: dict[str, Any], response_data: dict[str, Any], inde
     images: list[dict[str, str]] = []
     errors: list[str] = []
     output_dir_raw = str(payload.get("output_dir", "")).strip() or "outputs/images"
-    output_prefix = str(payload.get("output_prefix", "nano_banana")).strip() or "nano_banana"
+    output_prefix = _resolve_output_prefix(payload)
     output_dir = Path(output_dir_raw) if output_dir_raw else None
 
     image_count = 0
@@ -433,6 +460,10 @@ def register(registry) -> None:
                     "batch_count": {"type": "integer"},
                     "output_dir": {"type": "string"},
                     "output_prefix": {"type": "string"},
+                    "auto_prefix_from_prompt": {
+                        "type": "boolean",
+                        "description": "When true and output_prefix is empty, derive a semantic filename prefix from prompt.",
+                    },
                     "image_only": {"type": "boolean"},
                 },
                 "required": ["mode"],
