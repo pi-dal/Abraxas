@@ -17,3 +17,4 @@ distribution = false
 [tool.pdm.scripts]
 abraxas-cli = { cmd = "python -m channel.cli", env = { PYTHONPATH = "src" } }
 abraxas-telegram = { cmd = "python -m channel.telegram_runner", env = { PYTHONPATH = "src" } }
+abraxas-trigger = { cmd = "python -m channel.trigger_cli", env = { PYTHONPATH = "src" } }
