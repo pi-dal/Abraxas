@@ -23,6 +23,7 @@ import core.memory as core_memory
 import core.nous as core_nous
 import core.scheduler as core_scheduler
 import core.settings as core_settings
+import core.tool_protocol as core_tool_protocol
 from core.bot import SYSTEM_PROMPT
 from core.registry import build_tool_registry, create_reloadable_tool_registry
 from core import tools as core_tools
@@ -99,6 +100,16 @@ class BotTests(unittest.TestCase):
         self.assertIn("plugin", SYSTEM_PROMPT.lower())
         self.assertIn("[builtin]", SYSTEM_PROMPT)
         self.assertIn("[plugin]", SYSTEM_PROMPT)
+
+    def test_system_prompt_mentions_capabilities_layer(self):
+        self.assertIn("src/capabilities", SYSTEM_PROMPT)
+
+    def test_capabilities_layer_exists(self):
+        repo_root = pathlib.Path(__file__).resolve().parent
+        self.assertTrue((repo_root / "src" / "capabilities" / "__init__.py").exists())
+        self.assertTrue((repo_root / "src" / "capabilities" / "main_model.py").exists())
+        self.assertTrue((repo_root / "src" / "capabilities" / "runtime_auth.py").exists())
+        self.assertTrue((repo_root / "src" / "capabilities" / "scheduler.py").exists())
 
     def test_core_layer_exists(self):
         self.assertEqual(core_tools.TOOLS[0]["function"]["name"], "bash")
@@ -186,6 +197,59 @@ class BotTests(unittest.TestCase):
     def test_settings_use_single_runtime_loader(self):
         self.assertFalse(hasattr(core_settings, "load_settings"))
         self.assertFalse(hasattr(core_settings, "load_telegram_settings"))
+
+    def test_build_main_model_client_uses_openai_defaults(self):
+        from capabilities.main_model import build_main_model_client
+
+        fake_client = object()
+        with patch("capabilities.main_model.OpenAI") as mock_openai:
+            mock_openai.return_value = fake_client
+            client, model = build_main_model_client(
+                {"api_key": "token", "base_url": "https://example.com", "model": "demo-model"}
+            )
+        self.assertIs(client, fake_client)
+        self.assertEqual(model, "demo-model")
+        mock_openai.assert_called_once_with(api_key="token", base_url="https://example.com")
+
+    def test_tool_protocol_repairs_message_history(self):
+        normalized = core_tool_protocol.render_messages_for_api(
+            [
+                {"role": "system", "content": "base"},
+                {"role": "system", "content": "extra"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "bash", "arguments": {"command": "pwd"}},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "orphaned",
+                    "name": "bash",
+                    "content": "ignored",
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "name": "bash",
+                    "content": "/tmp",
+                },
+            ],
+            normalize_tool_call=core_tool_protocol.normalize_tool_call,
+        )
+
+        self.assertEqual(normalized[0]["role"], "system")
+        self.assertIn("base", normalized[0]["content"])
+        self.assertIn("extra", normalized[0]["content"])
+        self.assertEqual(normalized[1]["role"], "assistant")
+        self.assertEqual(normalized[1]["tool_calls"][0]["function"]["arguments"], "{\"command\": \"pwd\"}")
+        self.assertEqual(normalized[2]["role"], "tool")
+        self.assertEqual(normalized[2]["tool_call_id"], "call_1")
 
     def test_load_skills_prompt_reads_markdown_files(self):
         with tempfile.TemporaryDirectory() as td:
