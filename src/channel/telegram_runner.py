@@ -2,9 +2,9 @@ import time
 import threading
 from typing import Any
 
+from capabilities.scheduler import DailyScheduler, MultiDailyScheduler, WeeklyScheduler
 from core.bot import CodingBot
 from core.registry import ReloadableToolRegistry, create_reloadable_tool_registry
-from core.scheduler import DailyScheduler, MultiDailyScheduler, WeeklyScheduler
 from core.settings import load_runtime_settings
 
 from .telegram_client import TelegramClient, sync_telegram_commands

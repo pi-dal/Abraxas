@@ -5,10 +5,7 @@ from typing import Any, Callable
 from typing import Protocol
 from types import SimpleNamespace
 
-try:
-    from openai import OpenAI
-except Exception:  # pragma: no cover - optional dependency path
-    OpenAI = None  # type: ignore[assignment]
+from capabilities.main_model import build_main_model_client
 
 from .memory import create_memory_runtime
 from .nous import load_nous_prompt
@@ -31,6 +28,7 @@ from .settings import (
 from .skills import load_skills_prompt
 from .tools import create_default_registry, tool_label
 from .bot_hitl import ExecutionStoppedError, inject_execution_controller
+from . import tool_protocol
 
 
 class ToolRuntime(Protocol):
@@ -43,6 +41,7 @@ class ToolRuntime(Protocol):
 SYSTEM_PROMPT = (
     "You are Abraxas, a coding bot. Be concise. "
     "Treat src/core and src/channel as protected runtime code and do not edit them unless the user explicitly asks. "
+    "Treat src/capabilities as the reusable runtime capability layer that sits beside the agent core. "
     "Prefer applying skills in src/skills first. "
     "Treat src/memory as a first-class memory layer, parallel to skills. "
     "If skills cannot solve the task, extend behavior via plugins in src/plugins. "
@@ -129,14 +128,9 @@ class CodingBot:
         session_id: str | None = None,
         tool_registry: ToolRuntime | None = None,
     ):
-        if OpenAI is None:
-            raise RuntimeError(
-                "openai package is required to initialize CodingBot. "
-                "Install project dependencies (for example: `pdm install`)."
-            )
         config = load_runtime_settings()
-        self.client = OpenAI(api_key=config["api_key"], base_url=str(config["base_url"]))
-        self.model = model or str(config["model"])
+        self.client, default_model = build_main_model_client(config)
+        self.model = model or default_model
         self.tool_registry = tool_registry or create_default_registry()
         self.messages = [{"role": "system", "content": build_system_prompt(settings=config)}]
         self.memory_runtime = create_memory_runtime(settings=config)
@@ -521,110 +515,14 @@ class CodingBot:
 
     @staticmethod
     def _normalize_tool_call(tool_call: Any) -> dict[str, Any]:
-        fn = getattr(tool_call, "function", None)
-        name = str(getattr(fn, "name", "")).strip()
-        raw_arguments = getattr(fn, "arguments", "")
-        if isinstance(raw_arguments, str):
-            arguments = raw_arguments
-        else:
-            try:
-                arguments = json.dumps(raw_arguments, ensure_ascii=True)
-            except Exception:
-                arguments = "{}"
-        return {
-            "id": str(getattr(tool_call, "id", "")).strip(),
-            "type": "function",
-            "function": {
-                "name": name,
-                "arguments": arguments,
-            },
-        }
+        return tool_protocol.normalize_tool_call(tool_call)
 
     @staticmethod
     def _prepare_messages_for_api(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        prepared: list[dict[str, Any]] = []
-        system_index: int | None = None
-        pending_tool_call_ids: set[str] = set()
-
-        for message in messages:
-            role = str(message.get("role", "")).strip()
-            if role not in {"system", "user", "assistant", "tool"}:
-                continue
-
-            content = message.get("content", "")
-            if not isinstance(content, str):
-                content = str(content)
-
-            if role == "system":
-                pending_tool_call_ids.clear()
-                if system_index is None:
-                    prepared.append({"role": "system", "content": content})
-                    system_index = len(prepared) - 1
-                else:
-                    merged = str(prepared[system_index].get("content", ""))
-                    if content.strip():
-                        prepared[system_index]["content"] = f"{merged}\n\n{content}" if merged else content
-                continue
-
-            entry: dict[str, Any] = {"role": role}
-
-            if role == "assistant":
-                tool_calls = message.get("tool_calls")
-                if isinstance(tool_calls, list) and tool_calls:
-                    normalized_calls: list[dict[str, Any]] = []
-                    for call in tool_calls:
-                        if not isinstance(call, dict):
-                            continue
-                        fn = call.get("function")
-                        if not isinstance(fn, dict):
-                            continue
-                        call_id = str(call.get("id", "")).strip()
-                        fn_name = str(fn.get("name", "")).strip()
-                        fn_args = fn.get("arguments", "")
-                        if not isinstance(fn_args, str):
-                            try:
-                                fn_args = json.dumps(fn_args, ensure_ascii=True)
-                            except Exception:
-                                fn_args = "{}"
-                        if not call_id or not fn_name:
-                            continue
-                        normalized_calls.append(
-                            {
-                                "id": call_id,
-                                "type": "function",
-                                "function": {"name": fn_name, "arguments": fn_args},
-                            }
-                        )
-                    if normalized_calls:
-                        entry["tool_calls"] = normalized_calls
-                        entry["content"] = content if content.strip() else ""
-                        pending_tool_call_ids = {
-                            str(item.get("id", "")).strip()
-                            for item in normalized_calls
-                            if str(item.get("id", "")).strip()
-                        }
-                    else:
-                        entry["content"] = content
-                        pending_tool_call_ids.clear()
-                else:
-                    entry["content"] = content
-                    pending_tool_call_ids.clear()
-            elif role == "tool":
-                tool_call_id = str(message.get("tool_call_id", "")).strip()
-                if not tool_call_id or tool_call_id not in pending_tool_call_ids:
-                    continue
-                entry["content"] = content
-                entry["tool_call_id"] = tool_call_id
-                tool_name = str(message.get("name", "")).strip()
-                if tool_name:
-                    entry["name"] = tool_name
-                pending_tool_call_ids.discard(tool_call_id)
-            else:
-                entry["content"] = content
-                pending_tool_call_ids.clear()
-
-            prepared.append(entry)
-        return prepared
+        return tool_protocol.render_messages_for_api(
+            messages,
+            normalize_tool_call=tool_protocol.normalize_tool_call,
+        )
 
     @staticmethod
     def _is_context_overflow_error(exc: Exception) -> bool:
@@ -1076,26 +974,12 @@ class CodingBot:
 
                 if intercepted:
                     pending = controller.pending_tool_call if controller is not None else None
-                    for tc in tool_calls:
-                        tc_id = str(getattr(tc, "id", "")).strip()
-                        if pending and tc_id == pending.tool_call_id:
-                            continue
-                        fn_obj = getattr(tc, "function", None)
-                        tc_name = str(getattr(fn_obj, "name", "")).strip()
-                        if tc_id:
-                            self.messages.append(
-                                {
-                                    "role": "tool",
-                                    "tool_call_id": tc_id,
-                                    "name": tc_name,
-                                    "content": "[Skipped: another tool call in this batch was intercepted for human approval]",
-                                }
-                            )
-                    return (
-                        "[INTERCEPTED] Tool call requires approval.\n\n"
-                        f"⚠️ Pending Tool Call: {pending.tool_name}\n"
-                        f"Parameters: {pending.parameters}"
+                    skipped = tool_protocol.build_skipped_results_for_intercepted_batch(
+                        list(tool_calls),
+                        intercepted_tool_call_id=pending.tool_call_id if pending is not None else "",
                     )
+                    self.messages.extend(skipped)
+                    return tool_protocol.format_intercepted_message(pending)
 
                 for tool_call in tool_calls:
                     function_obj = getattr(tool_call, "function", None)
@@ -1108,12 +992,7 @@ class CodingBot:
                         on_tool_result(tool_name, tool_arguments, tool_output)
                     tool_call_id = str(getattr(tool_call, "id", ""))
                     self.messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tool_call_id,
-                            "name": tool_name,
-                            "content": tool_output,
-                        }
+                        tool_protocol.build_tool_result_message(tool_call_id, tool_name, tool_output)
                     )
                     if hasattr(self, "tape"):
                         self.tape.append("tool", tool_output, name=tool_name, tool_call_id=tool_call_id)

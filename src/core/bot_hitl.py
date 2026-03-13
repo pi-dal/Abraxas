@@ -8,6 +8,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from . import tool_protocol
+
 
 HIGH_RISK_TOOLS = {"bash", "write", "python_eval", "tmux_manager"}
 
@@ -333,27 +335,13 @@ def _run_hitl_continuation(bot: Any) -> str:
                 break
 
         if intercepted:
-            # Inject synthetic "skipped" responses for all other tool calls in this batch
-            # so the message history remains valid for the next API call.
-            for tc in tool_calls:
-                tc_id = str(getattr(tc, "id", "")).strip()
-                if tc_id == intercepted_id:
-                    continue
-                fn = getattr(tc, "function", None)
-                tc_name = str(getattr(fn, "name", "")).strip()
-                if tc_id:
-                    bot.messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc_id,
-                        "name": tc_name,
-                        "content": "[Skipped: another tool in this batch was intercepted for human approval]",
-                    })
-            pending = controller.pending_tool_call
-            return (
-                f"[INTERCEPTED] Tool call requires approval.\n\n"
-                f"⚠️ Pending Tool Call: {pending.tool_name}\n"
-                f"Parameters: {pending.parameters}"
+            skipped = tool_protocol.build_skipped_results_for_intercepted_batch(
+                list(tool_calls),
+                intercepted_tool_call_id=intercepted_id or "",
             )
+            bot.messages.extend(skipped)
+            pending = controller.pending_tool_call
+            return tool_protocol.format_intercepted_message(pending)
 
         # No interception — execute all tool calls in this batch
         for tool_call in tool_calls:
@@ -372,12 +360,9 @@ def _run_hitl_continuation(bot: Any) -> str:
             except Exception as exc:
                 tool_output = f"Tool error: {exc}"
 
-            bot.messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call_id,
-                "name": tool_name,
-                "content": tool_output,
-            })
+            bot.messages.append(
+                tool_protocol.build_tool_result_message(tool_call_id, tool_name, tool_output)
+            )
             if hasattr(bot, "tape"):
                 bot.tape.append("tool", tool_output, name=tool_name, tool_call_id=tool_call_id)
 
@@ -433,12 +418,9 @@ def inject_execution_controller(cls) -> type:
         # The assistant message with tool_calls was already appended when interception
         # happened, so the message order here is:
         #   assistant(tool_calls=[...]) → tool(result) → [_run_hitl_continuation LLM call]
-        self.messages.append({
-            "role": "tool",
-            "tool_call_id": tool_call_id,
-            "name": tool_name,
-            "content": tool_output,
-        })
+        self.messages.append(
+            tool_protocol.build_tool_result_message(tool_call_id, tool_name, tool_output)
+        )
 
         if hasattr(self, "tape"):
             self.tape.append("tool", tool_output, name=tool_name, tool_call_id=tool_call_id)
@@ -478,18 +460,12 @@ def inject_execution_controller(cls) -> type:
         tool_name = pending.tool_name
         tool_call_id = self._execution_controller.deny_pending()
 
-        denial_content = (
-            "[Action denied by human user - tool execution rejected. "
-            "Please try an alternative approach or ask for approval.]"
-        )
+        denial_content = tool_protocol.DENIED_TOOL_RESULT
         # Inject synthetic tool response so the message history stays valid:
         #   assistant(tool_calls=[...]) → tool(denial) → [_run_hitl_continuation LLM call]
-        self.messages.append({
-            "role": "tool",
-            "tool_call_id": tool_call_id,
-            "name": tool_name,  # consistent with allow_pending_tool()
-            "content": denial_content,
-        })
+        self.messages.append(
+            tool_protocol.build_tool_result_message(tool_call_id, tool_name, denial_content)
+        )
 
         if hasattr(self, "tape"):
             self.tape.append("tool", denial_content, name=tool_name, tool_call_id=tool_call_id)
